@@ -322,6 +322,31 @@ commitsLoop:
 	}
 
 	log.Printf("%d commits to copy", len(commits))
+	// Exclude commits the destination already accounts for: their source
+	// digests appear as shipit source ids somewhere in the destination
+	// history. Shipit tags are the only synchronization state that
+	// persists through grit's push-only model, so they are what makes
+	// exactly-once processing hold for commits that selection alone
+	// cannot order with respect to the anchor — notably applied siblings
+	// of a failed run, which are not ancestors of its last applied
+	// commit. Legacy ids shorter than a full digest match by prefix,
+	// with the same collision window the anchor walk has always
+	// accepted; new tags record the full digest.
+	processed, err := processedSourceIDs(dst)
+	if err != nil {
+		log.Fatalf("processed source ids: %v", err)
+	}
+	{
+		filtered := commits[:0]
+		for _, c := range commits {
+			if isProcessed(c.Digest.Hex(), processed) {
+				log.Printf("skipping already synchronized %s", c)
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		commits = filtered
+	}
 	var ncommit int
 	var nskipped int
 	for i := len(commits) - 1; i >= 0; i-- {
@@ -333,7 +358,7 @@ commitsLoop:
 		if patch.Body != "" {
 			patch.Body += "\n\n"
 		}
-		shipitTag := fmt.Sprintf("fbshipit-source-id: %s", patch.ID.Hex()[:7])
+		shipitTag := fmt.Sprintf("fbshipit-source-id: %s", patch.ID.Hex())
 		patch.Body += shipitTag
 		// Apply filepath specific rules.
 		// Prefixes are already rewritten by the repo.
@@ -454,6 +479,37 @@ commitsLoop:
 	if err := dst.Push("origin", dstBranch); err != nil {
 		log.Fatalf("%s: push origin %s: %v", dst, dstBranch, err)
 	}
+}
+
+// processedSourceIDs returns the set of shipit source ids recorded in
+// the destination repository's history.
+func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
+	commits, err := dst.Log()
+	if err != nil {
+		return nil, err
+	}
+	processed := make(map[string]bool)
+	for _, c := range commits {
+		for _, id := range c.ShipitID() {
+			processed[id] = true
+		}
+	}
+	return processed, nil
+}
+
+// isProcessed reports whether the provided full source digest is
+// accounted for by a recorded shipit source id, either exactly or (for
+// legacy, abbreviated ids) by prefix.
+func isProcessed(hex string, processed map[string]bool) bool {
+	if processed[hex] {
+		return true
+	}
+	for id := range processed {
+		if len(id) < len(hex) && strings.HasPrefix(hex, id) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseSpec(spec string) (url, prefix, branch string) {

@@ -10,9 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+var regexpFullDigest = regexp.MustCompile(`fbshipit-source-id: [0-9a-f]{40}`)
 
 // gritCloneDir computes the local clone directory that grit's git.Open
 // derives for the provided repository URL, so that tests can inspect (and
@@ -212,4 +215,108 @@ func fileContains(t *testing.T, path, substr string) bool {
 		t.Fatal(err)
 	}
 	return strings.Contains(string(b), substr)
+}
+
+// TestV2TagSetExclusionExactlyOnce verifies that shipit-tag state makes
+// processing exactly-once across runs: after two sibling commits are
+// applied, a later incremental run re-selects the first sibling (it is
+// not an ancestor of the new anchor, which sits atop the second
+// sibling) but must exclude it by its recorded tag rather than replay
+// it. Also asserts that new tags record the full source digest.
+func TestV2TagSetExclusionExactlyOnce(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Two sibling branches off the synced base.
+	src.git("branch", "s1")
+	src.git("checkout", "s1")
+	src.write("proj/a.txt", "a")
+	src.commit("sibling one")
+	src.git("checkout", testBranch)
+	src.git("branch", "s2")
+	src.git("checkout", "s2")
+	src.write("proj/b.txt", "b")
+	src.commit("sibling two")
+	src.git("checkout", testBranch)
+	src.git("merge", "--no-ff", "-m", "merge s1", "s1")
+	src.git("merge", "--no-ff", "-m", "merge s2", "s2")
+	src.push()
+
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	tip := strings.TrimSpace(dst.gitOut("log", "--grep=fbshipit-source-id:", "-n", "1", "--format=%B"))
+	if !regexpFullDigest.MatchString(tip) {
+		t.Fatalf("newest tag is not a full 40-hex digest: %q", tip)
+	}
+
+	// A mainline commit on top of sibling two: the next run must exclude
+	// sibling one by tag (it is not an ancestor of the new anchor).
+	src.write("proj/c.txt", "c")
+	src.commit("mainline child of sibling two")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "skipping already synchronized") {
+		t.Fatalf("tag-set exclusion did not fire:\n%s", out)
+	}
+	if strings.Contains(out, "skipping converged") {
+		t.Fatalf("prune fired where tag exclusion should have:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("no fixed point after exclusion:\n%s", out)
+	}
+}
+
+// TestV2LegacyTagSuppressesReplay verifies that a destination commit
+// carrying a legacy abbreviated (7-hex) shipit id anchors the resume and
+// suppresses replay of its source commit, matching the anchor walk's
+// long-standing semantics. Prefix matching for legacy ids that exclude
+// non-ancestor commits is covered by TestIsProcessed.
+func TestV2LegacyTagSuppressesReplay(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// An unsynced source commit...
+	src.write("proj/x.txt", "x")
+	src.commit("unsynced source commit")
+	src.push()
+	series := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+
+	// ...whose content was already brought to the destination manually,
+	// tagged with a legacy abbreviated id.
+	dst.write("x.txt", "x")
+	dst.git("add", "x.txt")
+	dst.git("commit", "-m",
+		fmt.Sprintf("manual import\n\nfbshipit-source-id: %s\n", series[:7]))
+	dst.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("legacy tag did not suppress replay of the source commit:\n%s", out)
+	}
+	if !strings.Contains(out, "0 commits to copy") {
+		t.Fatalf("expected the legacy anchor to bound the selection:\n%s", out)
+	}
 }
