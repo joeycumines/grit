@@ -31,6 +31,34 @@ type Diff struct {
 	Body []byte
 }
 
+var zeroBlob = strings.Repeat("0", 40)
+
+// NewBlob returns the post-image blob digest recorded in the diff's
+// "index <old>..<new>[ <mode>]" metadata line. Deleted files record the
+// zero digest. The second return value is false when the diff carries no
+// usable index line.
+func (d Diff) NewBlob() (string, bool) {
+	for _, line := range bytes.Split(d.Meta, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("index ")) {
+			continue
+		}
+		rest := string(line[len("index "):])
+		parts := strings.SplitN(rest, "..", 2)
+		if len(parts) != 2 {
+			return "", false
+		}
+		newBlob := parts[1]
+		if i := strings.IndexByte(newBlob, ' '); i >= 0 {
+			newBlob = newBlob[:i]
+		}
+		if newBlob == "" {
+			return "", false
+		}
+		return newBlob, true
+	}
+	return "", false
+}
+
 // A Patch is a single, atomic change, originating in a Repo. Patches
 // comprise one or more diffs, representing file changes in a
 // repository. Patches may be derived from commits and applied to a

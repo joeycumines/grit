@@ -234,6 +234,16 @@ func main() {
 		}
 	}
 
+	// Make the source repository's objects available in the destination
+	// clone, so that three-way merges have the pre-image blobs recorded
+	// by patches at their disposal. Dump mode never applies anything and
+	// must not touch the destination repository.
+	if !*dump {
+		if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
+			log.Fatalf("fetch source objects: %v", err)
+		}
+	}
+
 	// Last synchronized commit that applies, if any. We apply the
 	// rewrite rules here, so that we skip commits that may be tagged
 	// with shipit IDs, but wouldn't actually come from the source
@@ -313,6 +323,7 @@ commitsLoop:
 
 	log.Printf("%d commits to copy", len(commits))
 	var ncommit int
+	var nskipped int
 	for i := len(commits) - 1; i >= 0; i-- {
 		c := commits[i]
 		patch, err := src.Patch(c.Digest, dst.Prefix())
@@ -346,8 +357,34 @@ commitsLoop:
 			log.Printf("skipping empty patch %s", patch.ID.Hex()[:7])
 			continue
 		}
+		// Drop diffs whose post-image already matches the destination:
+		// the change is present through another route (cherry-picks,
+		// direct merges), and applying it again would only conflict with
+		// itself. Commits whose diffs all drop are fully converged and
+		// are skipped without creating a destination commit; they carry
+		// no shipit tag, so they are simply re-examined (and re-pruned)
+		// on future runs until they become ancestors of an applied
+		// anchor. Note that this intentionally compares content only: a
+		// mode-only change with identical blobs would be pruned, but git
+		// does not record a distinct blob for such changes anyway.
+		var kept []git.Diff
+		for _, diff := range diffs {
+			newBlob, ok := diff.NewBlob()
+			if ok {
+				curBlob, err := dst.BlobHash(diff.Path)
+				if err == nil && curBlob == newBlob {
+					log.Printf("skipping converged %s in %s", diff.Path, c)
+					continue
+				}
+			}
+			kept = append(kept, diff)
+		}
+		if len(kept) == 0 {
+			nskipped++
+			continue
+		}
 		ncommit++
-		patch.Diffs = diffs
+		patch.Diffs = kept
 		if stripMessage {
 			patch.Subject = "Stripped commit"
 			patch.Body = "Commit message stripped.\n\n" + shipitTag
@@ -359,6 +396,15 @@ commitsLoop:
 		} else {
 			log.Printf("applying %s", c)
 			if err := dst.Apply(patch); err != nil {
+				if inProgress, _ := dst.InProgressAM(); inProgress {
+					log.Printf("conflict: %s did not apply cleanly", patch)
+					log.Printf("the session is paused for manual resolution in %s", dst.RepoRoot())
+					log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
+					log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
+					log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
+					log.Printf("             git -C %s am --continue", dst.RepoRoot())
+					log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
+				}
 				log.Fatalf("%s: apply %s: %s", dst, patch, err)
 			}
 			if !patch.MaybeContainsLFSPointer() {
@@ -383,13 +429,26 @@ commitsLoop:
 			}
 		}
 	}
+	if nskipped > 0 {
+		log.Printf("%d commits skipped as already converged", nskipped)
+	}
 
 	if !*push {
 		return
 	}
+	// Push when this run applied anything, or when the repository still
+	// holds commits from a manually continued session that have not been
+	// pushed yet.
 	if ncommit == 0 {
-		log.Print("nothing to do")
-		return
+		head, err := dst.Head()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if head == dst.OriginHead() {
+			log.Print("nothing to do")
+			return
+		}
+		log.Print("pushing previously resolved session")
 	}
 	log.Printf("pushing changes to %s %s", dstURL, dstBranch)
 	if err := dst.Push("origin", dstBranch); err != nil {

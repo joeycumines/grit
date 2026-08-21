@@ -51,12 +51,13 @@ const gitTimeLayout = "Mon, 2 Jan 2006 15:04:05 -0700"
 // A Repo is a cached git repository against which
 // supported git operations are issued.
 type Repo struct {
-	url    string
-	branch string
-	root   string
-	prefix string
-	lock   *flock.T
-	config map[string]string
+	url        string
+	branch     string
+	root       string
+	prefix     string
+	lock       *flock.T
+	config     map[string]string
+	originHead string
 }
 
 // Open returns a repo representing the provided git remote url, branch, and
@@ -90,17 +91,129 @@ func Open(url, prefix, branch string) (*Repo, error) {
 	if _, err := r.git(nil, "fetch", "origin", branch); err != nil {
 		return nil, err
 	}
-	if _, err := r.git(nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
+	// Capture the remote tip now: any later fetch (e.g. object seeding)
+	// overwrites FETCH_HEAD, so this is the only reliable moment.
+	head, err := r.Head()
+	if err != nil {
 		return nil, err
+	}
+	r.originHead, err = r.RevParse("FETCH_HEAD")
+	if err != nil {
+		return nil, err
+	}
+	// Preserve work that must survive across grit invocations: a paused
+	// git am session awaiting conflict resolution, and commits that a
+	// continued session has already created but that have not been
+	// pushed yet. Both are only ever written by grit itself, and
+	// discarding them would destroy manually resolved work. HEAD that is
+	// merely behind the remote tip is the normal case and gets reset.
+	inProgress, err := r.InProgressAM()
+	if err != nil {
+		return nil, err
+	}
+	if inProgress {
+		log.Printf("resuming interrupted git am session in %s", r.root)
+		return r, nil
+	}
+	ahead, err := r.IsAncestor(head, r.originHead)
+	if err != nil {
+		return nil, err
+	}
+	if !ahead {
+		log.Printf("preserving %s: local commits from a resolved session have not been pushed yet", r.root)
+		return r, nil
 	}
 	// Clear potentially interrupted run.
 	_, _ = r.git(nil, "am", "--abort")
+	if _, err := r.git(nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+// InProgressAM reports whether a git am session is paused in the
+// repository, awaiting conflict resolution.
+func (r *Repo) InProgressAM() (bool, error) {
+	_, err := os.Stat(filepath.Join(r.root, ".git", "rebase-apply"))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// IsAncestor reports whether ancestor is equal to or an ancestor of
+// descendant.
+func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
+	_, err := r.git(nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(err.Error(), "exit status 1") {
+		return false, nil
+	}
+	return false, err
+}
+
+// OriginHead returns the digest of the repository's remote tip for the
+// configured branch, as of the most recent Open.
+func (r *Repo) OriginHead() string {
+	return r.originHead
+}
+
+// Head returns the digest of the commit HEAD refers to.
+func (r *Repo) Head() (string, error) {
+	return r.RevParse("HEAD")
+}
+
+// RevParse returns the digest that the provided revision resolves to.
+func (r *Repo) RevParse(rev string) (string, error) {
+	out, err := r.git(nil, "rev-parse", rev)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// BlobHash returns the git blob digest of the file at the provided
+// repository-relative working tree path. Deleted files hash to the zero
+// digest, mirroring the index line of git diffs.
+func (r *Repo) BlobHash(path string) (string, error) {
+	if _, err := os.Stat(filepath.Join(r.root, filepath.FromSlash(path))); err != nil {
+		if os.IsNotExist(err) {
+			return strings.Repeat("0", 40), nil
+		}
+		return "", err
+	}
+	out, err := r.git(nil, "hash-object", "--", path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// FetchObjects fetches the provided branch from the local repository at
+// the provided path into a private ref, making the source repository's
+// objects (in particular the pre-image blobs recorded by patches)
+// available for three-way merges in this repository. The ref is local
+// plumbing and is never pushed.
+func (r *Repo) FetchObjects(path, branch string) error {
+	_, err := r.git(nil, "fetch", "--no-tags", path,
+		fmt.Sprintf("+refs/heads/%s:refs/grit/src", branch))
+	return err
 }
 
 // Prefix returns the prefix within the repository, as specified in Open.
 func (r *Repo) Prefix() string {
 	return r.prefix
+}
+
+// RepoRoot returns the repository's working directory on the local
+// filesystem.
+func (r *Repo) RepoRoot() string {
+	return r.root
 }
 
 func (r *Repo) String() string {
@@ -187,13 +300,17 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 		"--always", // to support empty commits
 		"--no-renames", "--no-stat", "--stdout",
 		"--format=", // diff content only
+		// Serialize binary deltas as applicable binary patches, rather
+		// than relying on git's default (which has changed across
+		// versions), so that git am can apply them everywhere.
+		"--binary",
 		"-1", id.Hex(),
 	)
 	if err != nil {
 		return Patch{}, err
 	}
 	raw, err := r.git(nil, "format-patch",
-		"--always", "--no-renames", "--no-stat", "-1", id.Hex(), "--stdout")
+		"--always", "--no-renames", "--no-stat", "--binary", "-1", id.Hex(), "--stdout")
 	if err != nil {
 		return Patch{}, err
 	}
@@ -261,7 +378,13 @@ func (r *Repo) Apply(patch Patch) error {
 		return fmt.Errorf("patch write: %v", err)
 	}
 	log.Debug.Printf("applying patch %s", patch.ID.Hex()[:7])
-	_, err := r.git(b.Bytes(), "am", "--keep-non-patch", "--keep-cr")
+	// --3way falls back to a three-way merge (base = the pre-image blob
+	// recorded in the patch's index line, ours = the local state,
+	// theirs = the patched state) whenever the textual patch does not
+	// apply. This converges content that arrived through other routes
+	// instead of failing, while leaving genuine conflicts paused for
+	// resolution.
+	_, err := r.git(b.Bytes(), "am", "--3way", "--keep-non-patch", "--keep-cr")
 	return err
 }
 
