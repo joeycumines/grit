@@ -35,6 +35,14 @@
 // histories are not linear (e.g., when accepting patches from
 // GitHub).
 //
+// Incremental synchronization
+//
+// When resuming from the last synchronized source commit X, grit
+// copies every commit in X..<branch> -- including commits merged in
+// from side branches after X was synced -- and applies them in
+// topological order, so linear histories are not required for
+// correctness.
+//
 // Rules
 //
 // Grit can apply a set of rewrite rules to source commits before
@@ -258,7 +266,9 @@ func main() {
 	if lastCommit == nil {
 		log.Printf("performing initial sync")
 		var err error
-		commits, err = src.Log("--no-merges")
+		// Topological order guarantees that every commit is applied after
+		// its ancestors, regardless of authorship dates or merges.
+		commits, err = src.Log("--no-merges", "--topo-order")
 		if err != nil {
 			log.Fatalf("log %s: %v", src, err)
 		}
@@ -273,7 +283,12 @@ func main() {
 		// from.
 		newestID := ids[len(ids)-1]
 		var err error
-		commits, err = src.Log(newestID+".."+srcBranch, "--ancestry-path", "--no-merges")
+		// Copy every source commit in newestID..srcBranch, not only those
+		// that descend from newestID: work merged into srcBranch from side
+		// branches ("Merge branch 'wip'") does not descend from an older tip
+		// of srcBranch, and must not be silently skipped. --topo-order keeps
+		// parents ahead of children so patches apply in dependency order.
+		commits, err = src.Log(newestID+".."+srcBranch, "--topo-order", "--no-merges")
 		if err != nil {
 			log.Fatalf("log %s: %v", src, err)
 		}
