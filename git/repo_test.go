@@ -348,6 +348,14 @@ func shell(t *testing.T, dir, script string) {
 	t.Helper()
 	cmd := exec.Command("bash", "-e", "-x")
 	cmd.Dir = dir
+	// Pin the initial branch for test repositories (git >= 2.28), so that
+	// tests pass regardless of the user's init.defaultBranch configuration:
+	// grit and these tests assume "master".
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=init.defaultBranch",
+		"GIT_CONFIG_VALUE_0=master",
+	)
 	script = `
 		function error {
 			echo "$@" 1>&2
