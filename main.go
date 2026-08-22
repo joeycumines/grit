@@ -8,7 +8,7 @@
 //
 // Usage:
 //
-// 	grit [-push] [-dump] [-linearize] src dst rules...
+//	grit [-push] [-dump] [-linearize] src dst rules...
 //
 // "grit -push src dst rules..." copies commits from the repository
 // src to the repository dst, applying the the given rules and, if
@@ -16,16 +16,16 @@
 // Repositories are named by url, prefix, and branch, with one of the
 // following syntaxes:
 //
-// 	url
-// 	url,prefix
-// 	url,prefix,branch
+//	url
+//	url,prefix
+//	url,prefix,branch
 //
 // The default prefix is "" and the default branch is "master". When a
 // prefix is specified, Grit considers constructs a view of the repository
 // limited to the given prefix path. Changes outside of this prefix are
 // discarded.
 //
-// Linearization
+// # Linearization
 //
 // If the flag -linearize is provided, then the source repository's
 // history is linearized before copying commits. Linearization is
@@ -35,7 +35,7 @@
 // histories are not linear (e.g., when accepting patches from
 // GitHub).
 //
-// Incremental synchronization
+// # Incremental synchronization
 //
 // When resuming from the last synchronized source commit X, grit
 // copies every commit in X..<branch> -- including commits merged in
@@ -43,74 +43,74 @@
 // topological order, so linear histories are not required for
 // correctness.
 //
-// Rules
+// # Rules
 //
 // Grit can apply a set of rewrite rules to source commits before
 // they are copied to the destination repository. Rules are specified
 // as "kind:param". Rules kinds are:
 //
-//  strip:regexp
-//    Strips diffs applied to files matching the given regular
-//    expression.
+//	strip:regexp
+//	  Strips diffs applied to files matching the given regular
+//	  expression.
 //
-//  strip-message:regexp
-//    Strips commit messages when all files with changes match the given
-//    regular expression. This rule can be used to push internal cross-repo
-//    maintenance changes that do not need a context in the external world. For
-//    example, go.mod and go.sum files.
+//	strip-message:regexp
+//	  Strips commit messages when all files with changes match the given
+//	  regular expression. This rule can be used to push internal cross-repo
+//	  maintenance changes that do not need a context in the external world. For
+//	  example, go.mod and go.sum files.
 //
-//  strip-commit:hash
-//    Strip the commit named by the given hash. This is useful for excluding
-//    troublesome commits that you know are safe to ignore.
+//	strip-commit:hash
+//	  Strip the commit named by the given hash. This is useful for excluding
+//	  troublesome commits that you know are safe to ignore.
 //
-//  rewrite:regexp:/old_re/new_re/
-//    For each file whose path matches regexp, regexp-replace each line in the
-//    file from old_re to new_re. For example, rule
+//	rewrite:regexp:/old_re/new_re/
+//	  For each file whose path matches regexp, regexp-replace each line in the
+//	  file from old_re to new_re. For example, rule
 //
-//  rewrite:go.mod$:/replace .* => .*//
-//    will remove all "replace from => to" directives from go.mod
-//    files.  The 2nd letter after the path regexp ('/' in the example)
-//    determines the separator character for the old and the new regexps. The
-//    previous example can also be written as
+//	rewrite:go.mod$:/replace .* => .*//
+//	  will remove all "replace from => to" directives from go.mod
+//	  files.  The 2nd letter after the path regexp ('/' in the example)
+//	  determines the separator character for the old and the new regexps. The
+//	  previous example can also be written as
 //
-//  rewrite:go.mod$:!replace .* => .*!!
+//	rewrite:go.mod$:!replace .* => .*!!
 //
-// One way sync
+// # One way sync
 //
 // Copy commits from the "project/" directory in repository
 // ssh://git@git.company.com/foo.git to the root directory in the
 // repository https://github.com/company/project.git. Diffs applied
 // to files named BUILD are skipped.
 //
-// 	grit -push ssh://git@git.company.com/foo.git,project/ \
+//	grit -push ssh://git@git.company.com/foo.git,project/ \
 //		https://github.com/company/project.git "strip:^BUILD$" "strip:/BUILD$"
 //
-// Two-way sync
+// # Two-way sync
 //
 // Assume we want to sync bidirectionally between two repositories:
 //
-//  repoA=ssh://git@company.example.com,go/src/github.com/grailbio/project.git
-//  repoB=ssh://git@github.com:github.com/grailbio/project.git
+//	repoA=ssh://git@company.example.com,go/src/github.com/grailbio/project.git
+//	repoB=ssh://git@github.com:github.com/grailbio/project.git
 //
 // We usually develop on repoA and mirror changes to repoB. We also want to
 // accept external contributions or upstream changes from repoB and push them to
 // repoA. To sync from repoA to repoB, do the following:
 //
-//  grit -push $repoA $repoB
+//	grit -push $repoA $repoB
 //
 // To sync from repoB to repo A, do the following:
 //
-//  # Pull changes from repoB to repoA. But don't push it automatically, since we want to
-//  # review them internally.
-//  grit $repoB $repoA
-//  # grailXXXXX is the copy of repoA managed by grit
-//  cd /var/tmp/grit/grailXXXXX
-//  # Squash changes into one
-//  git reset --soft origin/master && git commit --edit -m"$(git log --reverse HEAD..HEAD@{1})"
-//  # Start a regular code review process.
-//  arc diff
-//  # After the review is accepted, land the changes.
-//  arc land
+//	# Pull changes from repoB to repoA. But don't push it automatically, since we want to
+//	# review them internally.
+//	grit $repoB $repoA
+//	# grailXXXXX is the copy of repoA managed by grit
+//	cd /var/tmp/grit/grailXXXXX
+//	# Squash changes into one
+//	git reset --soft origin/master && git commit --edit -m"$(git log --reverse HEAD..HEAD@{1})"
+//	# Start a regular code review process.
+//	arc diff
+//	# After the review is accepted, land the changes.
+//	arc land
 package main
 
 import (
