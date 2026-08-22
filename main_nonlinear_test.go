@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -151,8 +152,13 @@ func (r *gritRepo) gritSync(dst *gritRepo, extraArgs ...string) {
 }
 
 // compareDirs fails the test unless the two directory trees are identical,
-// ignoring .git directories.
+// ignoring .git directories. It shells out to POSIX diff and therefore
+// skips on platforms without one.
 func compareDirs(t *testing.T, a, b string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX diff is unavailable on windows")
+	}
 	t.Helper()
 	cmd := exec.Command("diff", "-r", "-x", ".git", a, b)
 	out, err := cmd.CombinedOutput()

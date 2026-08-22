@@ -781,3 +781,41 @@ func TestV2RewrittenPathNeverPruned(t *testing.T) {
 		t.Fatalf("rewrite did not land at destination: %q", got)
 	}
 }
+
+// TestV2CaseOnlyRenameIsNotPruned pins case-sensitive path resolution in
+// convergence pruning: on case-insensitive filesystems, a case-only
+// rename serializes as delete+add, and the add half must not be pruned
+// just because the OS resolves it to the differently-cased existing
+// file. Without exact-name matching, the destination silently loses the
+// file.
+func TestV2CaseOnlyRenameIsNotPruned(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/readme", "contents\n")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Case-only rename: delete readme, add README with new content.
+	runGit(t, src.dir, "rm", "proj/readme")
+	src.write("proj/README", "renamed contents\n")
+	src.commit("case-only rename")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "skipping converged") {
+		t.Fatalf("case-only rename's add half was falsely pruned:\n%s", out)
+	}
+	dst.pull()
+
+	// Verify through git: the worktree-level check cannot distinguish
+	// cases on an insensitive filesystem.
+	tracked := dst.gitOut("ls-files")
+	if !strings.Contains(tracked, "README") || strings.Contains(tracked, "readme") {
+		t.Fatalf("case-only rename did not land at destination; tracked files:\n%s", tracked)
+	}
+}

@@ -269,14 +269,20 @@ func (r *Repo) RevParse(rev string) (string, error) {
 // hash to the zero digest with an empty mode, mirroring the index line
 // of git diffs. Symbolic links are hashed by their link text with mode
 // 120000 (what git stores), including broken links, so deletions of
-// broken symlinks are never mistaken for converged deletions.
+// broken symlinks are never mistaken for converged deletions. Path
+// resolution is case-sensitive even on case-insensitive filesystems: a
+// path is treated as present only when a directory entry matches its
+// base name exactly, so that case-only renames (delete+add pairs) can
+// never be pruned as converged.
 func (r *Repo) BlobHash(path string) (digest, mode string, err error) {
 	full := filepath.Join(r.root, filepath.FromSlash(path))
+	if present, err := exactNamePresent(filepath.Dir(full), filepath.Base(full)); err != nil {
+		return "", "", err
+	} else if !present {
+		return zeroBlob, "", nil
+	}
 	fi, lerr := os.Lstat(full)
 	if lerr != nil {
-		if os.IsNotExist(lerr) {
-			return zeroBlob, "", nil
-		}
 		return "", "", lerr
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
@@ -299,6 +305,26 @@ func (r *Repo) BlobHash(path string) (digest, mode string, err error) {
 		mode = "100755"
 	}
 	return strings.TrimSpace(string(out)), mode, nil
+}
+
+// exactNamePresent reports whether the directory contains an entry whose
+// name matches want exactly, byte-for-byte. Case-insensitive filesystems
+// resolve mismatched-case paths to existing entries; this check restores
+// the case sensitivity git's object model requires.
+func exactNamePresent(dir, want string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Name() == want {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // FetchObjects fetches the provided branch from the local repository at
