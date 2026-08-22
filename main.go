@@ -327,9 +327,18 @@ func main() {
 			log.Printf("anchor %s matched the grep but carries no own-line id; falling back to body-wide scan", lastCommit)
 			ids = lastCommit.ShipitID()
 		}
-		if len(ids) == 0 {
-			log.Fatalf("no fbshipit-source-id found in commit: %+v", lastCommit)
+		// Enforce the same minimum length as the exclusion set and
+		// strip-commit rules: shorter ids are untrustworthy anchors.
+		usable := ids[:0]
+		for _, id := range ids {
+			if len(id) >= 7 {
+				usable = append(usable, id)
+			}
 		}
+		if len(usable) == 0 {
+			log.Fatalf("no fbshipit-source-id of at least 7 characters found in commit: %+v", lastCommit)
+		}
+		ids = usable
 		// When a commit is a squash of multiple commits, they are sorted in
 		// ascending chronological order. So the last ID is the one we should sync
 		// from.
@@ -524,15 +533,7 @@ commitsLoop:
 			// Copy any LFS objects that were touched by this change.
 			// Doing it this way allows us to download only LFS objects
 			// that actually need to be transferred.
-			// Patch paths are destination-relative (the source prefix
-			// was rewritten); LFS pointer paths are source-relative.
-			// Match in source-relative space so that prefixed
-			// destinations are not silently skipped.
-			dstPrefix := dst.Prefix()
-			srcRelative := make(map[string]bool, len(patch.Diffs))
-			for _, diff := range patch.Diffs {
-				srcRelative[strings.TrimPrefix(diff.Path, dstPrefix)] = true
-			}
+			srcRelative := srcRelativeDiffPaths(patch.Diffs, dst.Prefix())
 			ptrs, err := dst.ListLFSPointers()
 			if err != nil {
 				log.Fatal(err)
@@ -604,6 +605,19 @@ func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
 		}
 	}
 	return processed, nil
+}
+
+// srcRelativeDiffPaths maps destination-relative diff paths back to
+// source-relative ones: patch paths carry the destination prefix (the
+// source prefix was rewritten away), while git-lfs pointer listings are
+// prefix-stripped. Matching happens in source-relative space so that
+// prefixed destinations are not silently skipped.
+func srcRelativeDiffPaths(diffs []git.Diff, dstPrefix string) map[string]bool {
+	srcRelative := make(map[string]bool, len(diffs))
+	for _, diff := range diffs {
+		srcRelative[strings.TrimPrefix(diff.Path, dstPrefix)] = true
+	}
+	return srcRelative
 }
 
 // isProcessed reports whether the provided full source digest is

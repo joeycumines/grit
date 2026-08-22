@@ -58,3 +58,25 @@ func TestRewriteDiffGuards(t *testing.T) {
 		t.Fatalf("textual rewrite broken: %q", text.Body)
 	}
 }
+
+func TestSrcRelativeDiffPaths(t *testing.T) {
+	diffs := []git.Diff{
+		{Path: "prefixed/deep/file.txt"},
+		{Path: "prefixed/other.bin"},
+		{Path: "unrelated"},
+	}
+	got := srcRelativeDiffPaths(diffs, "prefixed/")
+	for _, want := range []string{"deep/file.txt", "other.bin", "unrelated"} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+	if got["prefixed/deep/file.txt"] {
+		t.Error("destination prefix was not stripped")
+	}
+	// Unprefixed destinations leave paths untouched.
+	got = srcRelativeDiffPaths(diffs, "")
+	if !got["prefixed/deep/file.txt"] || len(got) != 3 {
+		t.Fatalf("empty destination prefix mishandled: %v", got)
+	}
+}
