@@ -246,6 +246,15 @@ func main() {
 		}
 	}
 
+	// Configuration mistakes that would silently mirror nothing must
+	// abort before any selection happens.
+	if err := src.CheckPrefixCasing(srcPrefix); err != nil {
+		log.Fatalf("%s: %v", src, err)
+	}
+	if err := dst.CheckPrefixCasing(dstPrefix); err != nil {
+		log.Fatalf("%s: %v", dst, err)
+	}
+
 	// A paused session takes priority over everything else: selection
 	// and convergence pruning must not make decisions against a worktree
 	// holding unresolved conflict markers. Dump mode applies nothing and
@@ -436,9 +445,10 @@ commitsLoop:
 		// are skipped without creating a destination commit; they carry
 		// no shipit tag, so they are simply re-examined (and re-pruned)
 		// on future runs until they become ancestors of an applied
-		// anchor. Content equality is the sole criterion: a pure mode
-		// change records no index line at all, so NewBlob reports !ok
-		// and such diffs are kept rather than pruned. Dump mode skips
+		// anchor. Convergence requires content and, when the diff
+		// declares one, mode to match; a pure mode change records no
+		// index line at all, so NewBlob reports !ok and such diffs are
+		// kept rather than pruned. Dump mode skips
 		// pruning entirely: it previews the unpruned candidate set from
 		// the source side only, since it cannot know the destination
 		// state that a real run will have built up when it reaches each
@@ -558,7 +568,7 @@ commitsLoop:
 			log.Print("nothing to do")
 			return
 		}
-		authored, err := dst.HeadIsGritAuthored()
+		authored, err := dst.UnpushedCommitsAreGritAuthored(dst.OriginHead())
 		if err != nil {
 			log.Fatal(err)
 		}

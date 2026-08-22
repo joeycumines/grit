@@ -43,6 +43,36 @@ func init() {
 // Dir is the directory in which git checkouts are made.
 var Dir = "/var/tmp/grit"
 
+// CachePath returns the clone directory grit derives for the provided
+// endpoint. The key covers everything that changes the clone's
+// semantics: two configurations sharing a URL but differing in branch
+// or prefix must not share a working clone, or preservation logic could
+// carry one configuration's unpushed state into the other's push.
+func CachePath(url, prefix, branch string) string {
+	base := filepath.Base(url)
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	h := sha256.New()
+	h.Write([]byte(url))
+	h.Write([]byte{0})
+	h.Write([]byte(prefix))
+	h.Write([]byte{0})
+	h.Write([]byte(branch))
+	b := h.Sum(nil)
+	// 128 bits of digest make cross-configuration collisions negligible
+	// while keeping directory names reasonably short.
+	return filepath.Join(Dir, fmt.Sprintf("%s%x", base, b[:16]))
+}
+
+// LegacyCachePath returns the clone directory that versions prior to the
+// per-endpoint keying derived for a URL, for announcement purposes.
+func LegacyCachePath(url string) string {
+	base := filepath.Base(url)
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	sum := sha256.Sum256([]byte(url))
+	return filepath.Join(Dir, fmt.Sprintf("%s%02x%02x%02x%02x",
+		base, sum[0], sum[1], sum[2], sum[3]))
+}
+
 // SHA1 is the digester used to represent Git hashes.
 var SHA1 = digest.Digester(crypto.SHA1)
 
@@ -110,16 +140,60 @@ func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 	return repo, nil
 }
 
+// CheckPrefixCasing verifies that the configured prefix matches a path
+// in HEAD's tree exactly. A prefix differing only by letter case would
+// silently select nothing on tree-level pathspec matching and drop every
+// diff on case-insensitive hosts; misconfiguration must abort loudly.
+// Absent prefixes are allowed: they can legitimately appear later in the
+// history during initial synchronization. Unborn repositories are
+// permitted and handled by their callers.
+func (r *Repo) CheckPrefixCasing(prefix string) error {
+	p := strings.Trim(prefix, "/")
+	if p == "" {
+		return nil
+	}
+	parent, want := "", p
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		parent, want = p[:i], p[i+1:]
+	}
+	args := []string{"ls-tree", "--name-only", "HEAD"}
+	if parent != "" {
+		args = append(args, "--", parent)
+	}
+	out, err := r.git(nil, args...)
+	if err != nil {
+		// An unborn or otherwise unreadable HEAD is not a casing
+		// problem; leave it to the caller's normal flows.
+		return nil
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name := line
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == want {
+			return nil
+		}
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name := line
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		if strings.EqualFold(name, want) {
+			return fmt.Errorf("configured prefix %q does not exist at HEAD, but %q differs only by letter case; fix the prefix spelling", p, name)
+		}
+	}
+	return nil
+}
+
 // openLocked performs the open while the repository's lock is held.
 func (r *Repo) openLocked() (*Repo, error) {
 	// Announce caches abandoned by the key derivation change (they were
 	// keyed by URL alone): paused sessions or resolved-but-unpushed work
 	// left there by older versions require manual attention before they
 	// are lost to cleanup.
-	legacySum := sha256.Sum256([]byte(r.url))
-	legacyBase := filepath.Base(strings.TrimSuffix(r.url, filepath.Ext(r.url)))
-	legacy := filepath.Join(Dir, fmt.Sprintf("%s%02x%02x%02x%02x", legacyBase,
-		legacySum[0], legacySum[1], legacySum[2], legacySum[3]))
+	legacy := LegacyCachePath(r.url)
 	if legacy != r.root {
 		if _, err := os.Stat(legacy); err == nil {
 			log.Printf("note: legacy clone cache %s is no longer used; inspect it for paused sessions before deleting", legacy)
@@ -179,7 +253,7 @@ func (r *Repo) openLocked() (*Repo, error) {
 			return nil, err
 		}
 		if !ahead {
-			authored, err := r.HeadIsGritAuthored()
+			authored, err := r.UnpushedCommitsAreGritAuthored(r.originHead)
 			if err != nil {
 				return nil, err
 			}
@@ -249,14 +323,21 @@ func (c *Commit) OwnLineShipitIDs() []string {
 	return ids
 }
 
-// HeadIsGritAuthored reports whether HEAD carries a shipit source id,
-// marking it as state grit itself created.
-func (r *Repo) HeadIsGritAuthored() (bool, error) {
-	commits, err := r.LogIgnoringPrefix("-1", "HEAD")
+// UnpushedCommitsAreGritAuthored reports whether every commit between
+// base and HEAD carries a shipit source id, marking the unpushed range
+// as state grit itself created. A single foreign commit buried under an
+// otherwise authored HEAD fails the check.
+func (r *Repo) UnpushedCommitsAreGritAuthored(base string) (bool, error) {
+	commits, err := r.LogIgnoringPrefix(base + "..HEAD")
 	if err != nil {
 		return false, err
 	}
-	return len(commits) == 1 && len(commits[0].OwnLineShipitIDs()) > 0, nil
+	for _, c := range commits {
+		if len(c.OwnLineShipitIDs()) == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Head returns the digest of the commit HEAD refers to.
@@ -309,6 +390,10 @@ func (r *Repo) BlobHash(path string) (digest, mode string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	// The filesystem exec bit stands in for the tree's mode here. On
+	// hosts where git ignores filemode the two can disagree; such skew
+	// only ever keeps diffs for application (loud) instead of pruning
+	// them (silent).
 	mode = "100644"
 	if fi.Mode().Perm()&0100 != 0 {
 		mode = "100755"

@@ -856,3 +856,68 @@ func TestV2CaseOnlySubdirRenameIsNotPruned(t *testing.T) {
 		t.Fatalf("subdir case-only rename did not land; tracked files:\n%s", tracked)
 	}
 }
+
+// TestV2SourceCloneStrayStateIsDiscarded verifies the source clone's
+// read-through-cache contract: stray local commits (e.g. residue of a
+// linearized run) never abort or leak into synchronization; the next
+// run discards them and mirrors the remote tip.
+func TestV2SourceCloneStrayStateIsDiscarded(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Stray, unpushed, non-grit state inside grit's own source clone.
+	sclone := gritCloneDir(t, src.bare, "proj/", testBranch)
+	if err := os.WriteFile(filepath.Join(sclone, "stray.txt"), []byte("stray\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, sclone, "add", "stray.txt")
+	runGit(t, sclone, "-c", "user.email=t@e", "-c", "user.name=t",
+		"commit", "-m", "stray source-clone commit")
+
+	// A real remote change follows.
+	src.write("proj/new.txt", "new\n")
+	src.commit("real source change")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "without a grit shipit id") {
+		t.Fatalf("source clone stray state aborted the run:\n%s", out)
+	}
+	if !strings.Contains(out, "applying") {
+		t.Fatalf("run did not apply the real source change:\n%s", out)
+	}
+	dst.pull()
+	if got := dstRead(t, dst.dir, "new.txt"); got != "new\n" {
+		t.Fatalf("remote change did not land: %q", got)
+	}
+	if _, err := os.Lstat(filepath.Join(dst.dir, "stray.txt")); err == nil {
+		t.Fatal("stray source-clone file leaked into the destination")
+	}
+}
+
+// TestV2CaseMismatchedPrefixAborts pins that a configured prefix whose
+// letter case does not match the repository's paths aborts loudly
+// instead of silently dropping every diff on case-insensitive hosts.
+func TestV2CaseMismatchedPrefixAborts(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",PROJ/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, "-push", srcSpec, dstSpec)
+	if !strings.Contains(out, "letter case") {
+		t.Fatalf("case-mismatched prefix did not abort loudly:\n%s", out)
+	}
+}
