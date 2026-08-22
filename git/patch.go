@@ -59,6 +59,36 @@ func (d Diff) NewBlob() (string, bool) {
 	return "", false
 }
 
+// NewMode returns the post-image file mode declared by the diff, when
+// one is recorded ("new file mode", a mode-change pair, or a trailing
+// token on the index line). Pure content modifications usually declare
+// none; the second return value is false in that case and in the
+// absence of any recognizable mode metadata.
+func (d Diff) NewMode() (string, bool) {
+	var fromIndex string
+	for _, line := range bytes.Split(d.Meta, []byte("\n")) {
+		line := string(line)
+		switch {
+		case strings.HasPrefix(line, "new file mode "):
+			return strings.TrimSpace(line[len("new file mode "):]), true
+		case strings.HasPrefix(line, "new mode "):
+			return strings.TrimSpace(line[len("new mode "):]), true
+		case strings.HasPrefix(line, "index "):
+			rest := line[len("index "):]
+			if i := strings.Index(rest, ".."); i >= 0 {
+				rest = rest[i+2:]
+				if j := strings.IndexByte(rest, ' '); j >= 0 {
+					fromIndex = rest[j+1:]
+				}
+			}
+		}
+	}
+	if fromIndex != "" {
+		return fromIndex, true
+	}
+	return "", false
+}
+
 // A Patch is a single, atomic change, originating in a Repo. Patches
 // comprise one or more diffs, representing file changes in a
 // repository. Patches may be derived from commits and applied to a

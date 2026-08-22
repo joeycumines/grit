@@ -655,3 +655,62 @@ func TestV2SymlinkConvergenceAndDeletion(t *testing.T) {
 		t.Fatalf("broken symlink still present at destination: %v", err)
 	}
 }
+
+// TestV2ModeFlipIsNotConverged pins that convergence pruning compares
+// modes as well as content: identical bytes with a pending exec-bit flip
+// must apply, leaving the destination executable — not silently pruned
+// into permanent divergence.
+func TestV2ModeFlipIsNotConverged(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// The destination directly creates the file non-executable; the
+	// source commit adds identical bytes AND the executable bit.
+	dst.write("tool.txt", "v2\n")
+	dst.commit("destination adds tool non-executable")
+	dst.push()
+	src.write("proj/tool.txt", "v2\n")
+	if err := os.Chmod(filepath.Join(src.dir, "proj", "tool.txt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	src.commit("source adds tool with exec bit")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "skipping converged") {
+		t.Fatalf("mode flip was falsely treated as converged:\n%s", out)
+	}
+	if !strings.Contains(out, "conflict") {
+		t.Fatalf("expected the mode difference to surface as a loud conflict:\n%s", out)
+	}
+
+	// Resolve by adopting the executable bit, then continue.
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
+	if err := os.Chmod(filepath.Join(clone, "tool.txt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, clone, "add", "tool.txt")
+	runGit(t, clone, "-c", "core.editor=true", "am", "--continue")
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "pushing previously resolved session") {
+		t.Fatalf("resolved mode conflict was not pushed:\n%s", out)
+	}
+	dst.pull()
+
+	fi, err := os.Stat(filepath.Join(dst.dir, "tool.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0100 == 0 {
+		t.Fatalf("executable bit did not land at destination: %v", fi.Mode())
+	}
+}

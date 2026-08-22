@@ -294,6 +294,9 @@ func main() {
 		}
 		log.Printf("commit %s is not applicable to %s: skipping", last[0], dst)
 		head = last[0].Digest.Hex() + "^"
+		if _, err := dst.RevParse(head); err != nil {
+			log.Fatalf("anchor walk reached tagged root commit %s with no parent; the oldest recorded shipit id cannot be matched against the source -- retag or rewrite destination history to repair", last[0])
+		}
 	}
 	var commits []*git.Commit
 	if lastCommit == nil {
@@ -433,6 +436,9 @@ commitsLoop:
 		// the source side only, since it cannot know the destination
 		// state that a real run will have built up when it reaches each
 		// patch.
+		// Convergence requires both content and (when the diff declares
+		// one) mode to match: identical bytes with a pending exec-bit
+		// flip are not present at the destination and must apply.
 		var kept []git.Diff
 		if *dump {
 			kept = diffs
@@ -440,10 +446,12 @@ commitsLoop:
 			for _, diff := range diffs {
 				newBlob, ok := diff.NewBlob()
 				if ok {
-					curBlob, err := dst.BlobHash(diff.Path)
+					curBlob, curMode, err := dst.BlobHash(diff.Path)
 					if err == nil && curBlob == newBlob {
-						log.Printf("skipping converged %s in %s", diff.Path, c)
-						continue
+						if newMode, ok := diff.NewMode(); !ok || newMode == curMode {
+							log.Printf("skipping converged %s in %s", diff.Path, c)
+							continue
+						}
 					}
 				}
 				kept = append(kept, diff)
@@ -688,7 +696,15 @@ func (r rules) isMessagePathStripped(path string) (bool, *regexp.Regexp) {
 }
 
 // rewriteDiff applies the rulesets rewrite rules to the provided diff.
+// Diffs carrying git binary sections are never rewritten. Note that git
+// serializes NUL-free binary files as ordinary textual diffs; such
+// payloads are indistinguishable from text at this level, so rewrite
+// rules should be anchored narrowly enough that they cannot match their
+// bytes.
 func (r rules) rewriteDiff(diff *git.Diff) {
+	if bytes.Contains(diff.Body, []byte("GIT binary patch")) {
+		return
+	}
 	for _, r := range r.rewrite {
 		if r.pathRe.MatchString(diff.Path) {
 			diff.Body = r.rewrite(diff.Body)

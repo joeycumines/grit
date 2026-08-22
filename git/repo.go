@@ -92,7 +92,8 @@ func Open(url, prefix, branch string) (*Repo, error) {
 	if err := r.lock.Lock(context.Background()); err != nil {
 		return nil, fmt.Errorf("lock %s: %v", path, err)
 	}
-	if err != nil {
+	fresh := err != nil
+	if fresh {
 		os.MkdirAll(path, 0777)
 		if _, err := r.git(nil, "clone", "--single-branch", r.url, r.root); err != nil {
 			return nil, err
@@ -128,6 +129,17 @@ func Open(url, prefix, branch string) (*Repo, error) {
 	ahead, err := r.IsAncestor(head, r.originHead)
 	if err != nil {
 		return nil, err
+	}
+	// Preservation decisions apply only to state that survived from a
+	// previous run. A freshly created clone simply starts wherever the
+	// remote's default branch points, which may legitimately be
+	// unrelated to the configured branch.
+	if fresh {
+		_, _ = r.git(nil, "am", "--abort")
+		if _, err := r.git(nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
+			return nil, err
+		}
+		return r, nil
 	}
 	if !ahead {
 		// Only grit-authored state (a shipit id at HEAD, as written for
@@ -226,39 +238,41 @@ func (r *Repo) RevParse(rev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// BlobHash returns the git blob digest of the file at the provided
-// repository-relative working tree path. Deleted files hash to the zero
-// digest, mirroring the index line of git diffs. Symbolic links are
-// hashed by their link text (what git stores), including broken links,
-// so deletions of broken symlinks are never mistaken for converged
-// deletions. The zero digest sentinel also documents behavior for
-// sha256-object-format repositories under the SHA1 digester; such
-// repositories fail loudly elsewhere.
-func (r *Repo) BlobHash(path string) (string, error) {
+// BlobHash returns the git blob digest and git file mode of the file at
+// the provided repository-relative working tree path. Deleted files
+// hash to the zero digest with an empty mode, mirroring the index line
+// of git diffs. Symbolic links are hashed by their link text with mode
+// 120000 (what git stores), including broken links, so deletions of
+// broken symlinks are never mistaken for converged deletions.
+func (r *Repo) BlobHash(path string) (digest, mode string, err error) {
 	full := filepath.Join(r.root, filepath.FromSlash(path))
-	fi, err := os.Lstat(full)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return zeroBlob, nil
+	fi, lerr := os.Lstat(full)
+	if lerr != nil {
+		if os.IsNotExist(lerr) {
+			return zeroBlob, "", nil
 		}
-		return "", err
+		return "", "", lerr
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(full)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		out, err := r.git([]byte(target), "hash-object", "--stdin")
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
-		return strings.TrimSpace(string(out)), nil
+		return strings.TrimSpace(string(out)), "120000", nil
 	}
 	out, err := r.git(nil, "hash-object", "--", path)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	mode = "100644"
+	if fi.Mode().Perm()&0100 != 0 {
+		mode = "100755"
+	}
+	return strings.TrimSpace(string(out)), mode, nil
 }
 
 // FetchObjects fetches the provided branch from the local repository at
