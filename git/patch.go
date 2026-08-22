@@ -230,7 +230,6 @@ func hasControlChars(p string) bool {
 }
 
 var errMalformedPatch = errors.New("malformed patch")
-var continueHeader = []byte(" ")
 
 // ParsePatchHead parses a patch header from the provided buffer.
 func parsePatchHeader(b []byte) (Patch, error) {

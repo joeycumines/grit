@@ -76,10 +76,14 @@ func TestV2DuplicateAddConvergence(t *testing.T) {
 	dst.pull()
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 
-	// The applied commit must carry the real change, not be empty.
+	// The applied commit carries the real change but — being partially
+	// pruned — deliberately no shipit tag, so it stays re-examinable.
 	tip := strings.TrimSpace(dst.gitOut("log", "-1", "--format=%B"))
-	if !strings.Contains(tip, "fbshipit-source-id: ") {
-		t.Fatalf("destination tip is not a grit commit: %q", tip)
+	if strings.Contains(tip, "fbshipit-source-id: ") {
+		t.Fatalf("partially-pruned commit was tagged: %q", tip)
+	}
+	if !strings.Contains(tip, "side work with duplicate add") {
+		t.Fatalf("destination tip is not the mirrored commit: %q", tip)
 	}
 
 	// Fixed point: a rerun has nothing to do and pushes nothing.
@@ -1121,5 +1125,95 @@ func TestV2AllTagsIneligibleIsFixedPoint(t *testing.T) {
 	}
 	if !strings.Contains(out, "nothing to do") {
 		t.Fatalf("all-ineligible state did not reach a fixed point:\n%s", out)
+	}
+}
+
+// TestV2PartiallyPrunedCommitReexamined pins the lifecycle of a commit
+// whose diffs partially converge: it lands without a shipit tag, its
+// kept change applies, an unchanged rerun is a quiet fixed point, and —
+// critically — if the destination later loses the applied half, the
+// re-examination restores it instead of freezing forever.
+func TestV2PartiallyPrunedCommitReexamined(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/a.txt", "A1\n")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// The source commit carries one duplicate half and one real half.
+	src.write("proj/a.txt", "A2\n")
+	src.write("proj/c.txt", "C\n")
+	src.commit("source adds duplicate and real change")
+	src.push()
+	// Order matters for the fixture: the destination must already hold
+	// the duplicate when the source commit is mirrored.
+	dst.write("c.txt", "C\n")
+	dst.commit("destination receives duplicate directly")
+	dst.push()
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "1 of 2 diffs already converged") {
+		t.Fatalf("partial convergence was not detected:\n%s", out)
+	}
+	if strings.Contains(strings.TrimSpace(dst.gitOut("log", "-1", "--format=%B")), "fbshipit-source-id:") {
+		t.Fatalf("partially-pruned commit was tagged, freezing it against re-examination")
+	}
+	dst.pull()
+
+	// Quiet fixed point while nothing diverges.
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("partial commit did not reach a fixed point:\n%s", out)
+	}
+
+	// The destination loses the applied half via a pure revert;
+	// re-examination must then restore it without noise. (A divergent
+	// rewrite would surface as a resolvable conflict instead — same
+	// lifecycle as TestV2SessionPauseResume.)
+	dst.write("a.txt", "A1\n")
+	dst.commit("destination reverts the applied half")
+	dst.push()
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "nothing to do") {
+		t.Fatalf("reverted half was not re-examined:\n%s", out)
+	}
+	dst.pull()
+	if got := dstRead(t, dst.dir, "a.txt"); got != "A2\n" {
+		t.Fatalf("applied half was not restored: %q", got)
+	}
+}
+
+// TestV2IndentedQuotationIsNotGritAuthored verifies that the
+// preservation gate's stricter flush-left requirement rejects a foreign
+// unpushed commit whose message merely quotes an id from an indented
+// block (which Log's dedentation would otherwise resurrect).
+func TestV2IndentedQuotationIsNotGritAuthored(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
+	foreign := "quoted prose\n\n    fbshipit-source-id: 0123456789abcdef0123456789abcdef01234567\n"
+	if err := os.WriteFile(filepath.Join(clone, "stray.txt"), []byte(foreign), 0666); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, clone, "add", "stray.txt")
+	runGit(t, clone, "-c", "user.email=t@e", "-c", "user.name=t",
+		"commit", "-m", foreign)
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "without a grit shipit id") {
+		t.Fatalf("indented quotation passed the authorship gate:\n%s", out)
 	}
 }

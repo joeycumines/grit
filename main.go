@@ -491,11 +491,28 @@ commitsLoop:
 			nskipped++
 			continue
 		}
-		// Counts attempts: am --3way may legitimately conclude "No
-		// changes -- Patch already applied" for a missed exclusion,
-		// creating no commit. Such misses self-heal on subsequent runs
-		// (the exclusion set grows from the tags that do land), so the
-		// imprecision is benign.
+		// A commit with pruned diffs is deliberately left without a
+		// shipit tag: tagging would permanently exclude it, freezing
+		// the pruned half even if the destination later loses that
+		// content. Untagged, it is re-examined on every run — the kept
+		// diffs no-op through three-way application while the pruned
+		// paths re-converge or resurface.
+		pruned := len(diffs) - len(kept)
+		if !*dump && pruned > 0 {
+			patch.Body = strings.TrimSuffix(patch.Body, "\n\n"+shipitTag)
+			log.Printf("%s: %d of %d diffs already converged; commit will remain re-examinable", c, pruned, len(diffs))
+		}
+		// Counts commits that actually moved the destination HEAD:
+		// am --3way may legitimately conclude "No changes -- Patch
+		// already applied" for a missed exclusion, creating no commit.
+		// Such misses self-heal on subsequent runs (the exclusion set
+		// grows from the tags that do land), so the imprecision is
+		// benign, and counting outcomes keeps untagged re-examinations
+		// from spamming empty pushes.
+		headBeforeApply, err := dst.Head()
+		if err != nil {
+			log.Fatal(err)
+		}
 		ncommit++
 		patch.Diffs = kept
 		if stripMessage {
@@ -519,6 +536,12 @@ commitsLoop:
 					log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
 				}
 				log.Fatalf("%s: apply %s: %s", dst, patch, err)
+			}
+			if headAfterApply, herr := dst.Head(); herr == nil && headAfterApply == headBeforeApply {
+				// Three-way application concluded that the destination
+				// already contained this change: nothing was committed.
+				ncommit--
+				log.Printf("no changes for %s; treated as converged", c)
 			}
 			if !patch.MaybeContainsLFSPointer() {
 				log.Debug.Printf("%s: patch contains no LFS pointers", patch)
@@ -786,15 +809,3 @@ func (r rules) isCommitApplicable(c *git.Commit, src *git.Repo) (bool, error) {
 	}
 	return ndiff > 0, nil
 }
-
-/*
-func isApplicableCommit(c *git.Commit, stripCommits []string) bool {
-	for _, stripped := range stripCommits {
-			if strings.HasPrefix(c.Digest.Hex(), stripped) {
-				return false
-			}
-	}
-	patch, err :=
-
-}
-*/
