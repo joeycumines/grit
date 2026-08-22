@@ -135,59 +135,52 @@ func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 	}
 	// Capture the remote tip now: any later fetch (e.g. object seeding)
 	// overwrites FETCH_HEAD, so this is the only reliable moment.
-	head, err := r.Head()
+	originHead, err := r.RevParse("FETCH_HEAD")
 	if err != nil {
 		return nil, err
 	}
-	r.originHead, err = r.RevParse("FETCH_HEAD")
-	if err != nil {
-		return nil, err
-	}
-	// Preserve work that must survive across grit invocations: a paused
-	// git am session awaiting conflict resolution, and commits that a
-	// continued session has already created but that have not been
-	// pushed yet. Both are only ever written by grit itself, and
-	// discarding them would destroy manually resolved work. HEAD that is
-	// merely behind the remote tip is the normal case and gets reset.
-	inProgress, err := r.InProgressAM()
-	if err != nil {
-		return nil, err
-	}
-	if inProgress {
-		log.Printf("resuming interrupted git am session in %s", r.root)
-		return r, nil
-	}
-	ahead, err := r.IsAncestor(head, r.originHead)
-	if err != nil {
-		return nil, err
-	}
-	// Preservation decisions apply only to destination clones, and only
-	// to state that survived from a previous run. Source clones are
-	// read-through caches whose local state (e.g. left by -linearize)
-	// is always discarded, and a freshly created destination clone
-	// simply starts wherever the remote's default branch points, which
-	// may legitimately be unrelated to the configured branch.
-	if !r.preserve || fresh {
-		_, _ = r.git(nil, "am", "--abort")
-		if _, err := r.git(nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
-			return nil, err
-		}
-		return r, nil
-	}
-	if !ahead {
-		// Only grit-authored state (a shipit id at HEAD, as written for
-		// every commit grit creates) may be preserved for a later push.
-		authored, err := r.HeadIsGritAuthored()
+	r.originHead = originHead
+	// Destination clones preserve work that must survive across grit
+	// invocations: a paused git am session awaiting conflict resolution,
+	// and commits that a continued session has already created but that
+	// have not been pushed yet. Both are only ever written by grit
+	// itself, and discarding them would destroy manually resolved work.
+	// HEAD that is merely behind the remote tip is the normal case and
+	// gets reset. Source clones are read-through caches: their local
+	// state — including anything left behind by -linearize or a stray
+	// session — is always discarded in favor of the remote tip, as is
+	// the state of a freshly created clone, which simply starts wherever
+	// the remote's default branch points and may be unrelated to the
+	// configured branch.
+	if r.preserve && !fresh {
+		inProgress, err := r.InProgressAM()
 		if err != nil {
 			return nil, err
 		}
-		if !authored {
-			return nil, fmt.Errorf("%s holds unpushed commits without a grit shipit id at HEAD; this is not grit-authored state -- inspect the repository and remove or explicitly adopt them before synchronizing", r.root)
+		if inProgress {
+			log.Printf("resuming interrupted git am session in %s", r.root)
+			return r, nil
 		}
-		log.Printf("preserving %s: local commits from a resolved session have not been pushed yet", r.root)
-		return r, nil
+		head, err := r.Head()
+		if err != nil {
+			return nil, err
+		}
+		ahead, err := r.IsAncestor(head, r.originHead)
+		if err != nil {
+			return nil, err
+		}
+		if !ahead {
+			authored, err := r.HeadIsGritAuthored()
+			if err != nil {
+				return nil, err
+			}
+			if !authored {
+				return nil, fmt.Errorf("%s holds unpushed commits without a grit shipit id at HEAD; this is not grit-authored state -- inspect the repository and remove or explicitly adopt them before synchronizing", r.root)
+			}
+			log.Printf("preserving %s: local commits from a resolved session have not been pushed yet", r.root)
+			return r, nil
+		}
 	}
-	// Clear potentially interrupted run.
 	_, _ = r.git(nil, "am", "--abort")
 	if _, err := r.git(nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
 		return nil, err

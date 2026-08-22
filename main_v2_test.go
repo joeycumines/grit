@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -610,6 +611,9 @@ func (r *gritRepo) writeSymlink(path, target string) {
 // converged (hashing through the target would never match), and a
 // broken symlink's deletion applies instead of being falsely pruned.
 func TestV2SymlinkConvergenceAndDeletion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks on windows requires privileges")
+	}
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -663,6 +667,9 @@ func TestV2SymlinkConvergenceAndDeletion(t *testing.T) {
 // must apply, leaving the destination executable — not silently pruned
 // into permanent divergence.
 func TestV2ModeFlipIsNotConverged(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("executable bits are not representable when core.filemode=false")
+	}
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
