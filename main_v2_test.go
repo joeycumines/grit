@@ -1092,25 +1092,34 @@ func TestV2QuotedPathRoundTrip(t *testing.T) {
 	}
 }
 
-// TestV2AllTagsIneligibleIsFixedPoint verifies that a destination whose
-// every tagged commit is anchor-ineligible under strip rules falls
-// through to a clean initial sync whose tag-set exclusion drops the
-// already-mirrored commits — a fixed point, not an error.
+// TestV2AllTagsIneligibleIsFixedPoint pins that a destination whose
+// every tagged commit becomes anchor-ineligible under newly tightened
+// strip rules falls through to initial sync, where tag-set exclusion
+// drops the already-mirrored commits — a clean fixed point with the
+// exclusion actively engaged, not an error.
 func TestV2AllTagsIneligibleIsFixedPoint(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
 	dstSpec := dst.bare + ",," + testBranch
 
-	// Seed the destination directly with content the source will later
-	// carry, then let grit mirror it: the mirrored commit touches only
-	// proj/build (which the strip rule below excludes).
-	src.write("proj/build", "one\n")
-	src.commit("build-only change")
+	// Mirror a commit normally: it lands tagged at the destination.
+	src.write("proj/f.txt", "one\n")
+	src.commit("mirrored change")
 	src.push()
-	// Strip rules match destination-relative paths.
-	out := gritOutput(t, src.gritBin, srcSpec, dstSpec, "strip:^build$")
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Tighten the strip rules so that the recorded tag becomes
+	// anchor-ineligible, then synchronize again.
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec, "strip:^f\\.txt$")
+	if !strings.Contains(out, "is not applicable") {
+		t.Fatalf("ineligible anchor was not detected and stepped past:\n%s", out)
+	}
+	if !strings.Contains(out, "skipping already synchronized") {
+		t.Fatalf("tag-set exclusion did not drop the already-mirrored commit:\n%s", out)
+	}
 	if !strings.Contains(out, "nothing to do") {
-		t.Fatalf("stripped-only history did not reach a fixed point:\n%s", out)
+		t.Fatalf("all-ineligible state did not reach a fixed point:\n%s", out)
 	}
 }

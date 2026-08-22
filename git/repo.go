@@ -480,11 +480,11 @@ func (r *Repo) Log(args ...string) (commits []*Commit, err error) {
 	}
 	out, err := r.git(nil, args...)
 	if err != nil {
-		// A prefix absent from the worktree is the one tolerated
-		// failure: detect it via the filesystem rather than git's
-		// (locale-dependent) error text.
-		if _, statErr := os.Stat(filepath.Join(r.root,
-			filepath.FromSlash(strings.Trim(r.prefix, "/")))); os.IsNotExist(statErr) {
+		// Tolerate exactly upstream's tolerated failure: a pathspec
+		// absent from the working tree. Matching on git's message keeps
+		// every other failure loud; a localized git would turn this one
+		// case loud as well, which is the safe direction.
+		if strings.Contains(err.Error(), "path not in the working tree") {
 			log.Printf("%s: prefix %q is absent; treating log as empty", r.root, r.prefix)
 			return nil, nil
 		}
