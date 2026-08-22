@@ -200,11 +200,14 @@ func TestV2SessionPauseResume(t *testing.T) {
 	}
 }
 
-func gritOutput(t *testing.T, bin, srcSpec, dstSpec string) string {
+func gritOutput(t *testing.T, bin, srcSpec, dstSpec string, extra ...string) string {
 	t.Helper()
-	cmd := exec.Command(bin,
-		"-config=user.name=test,user.email="+testAuthorEnv,
-		"-push", srcSpec, dstSpec)
+	args := []string{
+		"-config=user.name=test,user.email=" + testAuthorEnv,
+		"-push", srcSpec, dstSpec,
+	}
+	args = append(args, extra...)
+	cmd := exec.Command(bin, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Logf("grit exited non-zero (expected when pausing):\n%s", out)
@@ -711,5 +714,63 @@ func TestV2ModeFlipIsNotConverged(t *testing.T) {
 	}
 	if fi.Mode().Perm()&0100 == 0 {
 		t.Fatalf("executable bit did not land at destination: %v", fi.Mode())
+	}
+}
+
+// TestV2RewrittenPathNeverPruned pins that convergence pruning is
+// disabled for rewrite-rule paths: the recorded post-image is pre-rewrite,
+// so blob equality would silently freeze un-rewritten content into the
+// destination. With the rule active, raw upstream content must be
+// rewritten on application.
+func TestV2RewrittenPathNeverPruned(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+	rule := `rewrite:f\.txt$:/RAWVALUE/DONEVALUE/`
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec, rule)
+	dst.pull()
+
+	// Raw upstream form arrives at the destination through a direct
+	// commit — exactly what a rewrite rule exists to translate.
+	dst.write("f.txt", "RAWVALUE\n")
+	dst.commit("destination receives raw form")
+	dst.push()
+
+	src.write("proj/f.txt", "RAWVALUE\n")
+	src.commit("source change requiring rewrite")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec, rule)
+	if strings.Contains(out, "skipping converged") {
+		t.Fatalf("rewritable path was falsely pruned as converged:\n%s", out)
+	}
+	// Raw-at-destination versus rewritten-in-source is a genuine content
+	// difference: it must surface loudly, never be frozen in by pruning.
+	if !strings.Contains(out, "conflict") {
+		t.Fatalf("expected the raw/rewritten divergence to surface as a conflict:\n%s", out)
+	}
+
+	// Resolve by adopting the rewritten form, then publish.
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
+	if err := os.WriteFile(filepath.Join(clone, "f.txt"), []byte("DONEVALUE\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, clone, "add", "f.txt")
+	runGit(t, clone, "-c", "core.editor=true", "am", "--continue")
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec, rule)
+	if !strings.Contains(out, "pushing previously resolved session") {
+		t.Fatalf("resolved rewrite conflict was not pushed:\n%s", out)
+	}
+	dst.pull()
+
+	got := strings.TrimSpace(dstRead(t, dst.dir, "f.txt"))
+	if got != "DONEVALUE" {
+		t.Fatalf("rewrite did not land at destination: %q", got)
 	}
 }

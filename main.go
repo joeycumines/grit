@@ -451,6 +451,16 @@ commitsLoop:
 			kept = diffs
 		} else {
 			for _, diff := range diffs {
+				// Rewritable paths are exempt from convergence pruning:
+				// the recorded post-image is pre-rewrite, while
+				// application materializes rewritten content, so blob
+				// equality would compare unrelated forms and either
+				// freeze un-rewritten content into the destination or
+				// miss legitimately converged rewrites.
+				if rules.mayRewrite(diff.Path) {
+					kept = append(kept, diff)
+					continue
+				}
 				newBlob, ok := diff.NewBlob()
 				if ok {
 					curBlob, curMode, err := dst.BlobHash(diff.Path)
@@ -674,6 +684,17 @@ type rules struct {
 func (r rules) isStripped(c *git.Commit) bool {
 	for _, stripped := range r.stripCommits {
 		if strings.HasPrefix(c.Digest.Hex(), stripped) {
+			return true
+		}
+	}
+	return false
+}
+
+// mayRewrite reports whether any rewrite rule targets the provided
+// path.
+func (r rules) mayRewrite(path string) bool {
+	for _, rule := range r.rewrite {
+		if rule.pathRe.MatchString(path) {
 			return true
 		}
 	}

@@ -100,6 +100,18 @@ func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 	// 128 bits of digest make cross-configuration collisions negligible
 	// while keeping directory names reasonably short.
 	path := filepath.Join(Dir, fmt.Sprintf("%s%x", base, b[:16]))
+	// Announce caches abandoned by the key derivation change (they were
+	// keyed by URL alone): paused sessions or resolved-but-unpushed work
+	// left there by older versions require manual attention before they
+	// are lost to cleanup.
+	legacySum := sha256.Sum256([]byte(url))
+	legacy := filepath.Join(Dir, fmt.Sprintf("%s%02x%02x%02x%02x", base,
+		legacySum[0], legacySum[1], legacySum[2], legacySum[3]))
+	if legacy != path {
+		if _, err := os.Stat(legacy); err == nil {
+			log.Printf("note: legacy clone cache %s is no longer used; inspect it for paused sessions before deleting", legacy)
+		}
+	}
 	r := &Repo{url: url, root: path, prefix: prefix, branch: branch, preserve: preserve}
 	r.lock = flock.New(path + ".lock")
 	if err := r.lock.Lock(context.Background()); err != nil {
