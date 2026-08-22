@@ -58,7 +58,10 @@ func TestV2DuplicateAddConvergence(t *testing.T) {
 	src.commit("side work with duplicate add")
 	src.push()
 
-	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "skipping converged data.bin") {
+		t.Fatalf("prune did not drop the identical addition (this is what distinguishes pruning from am --3way's own duplicate handling):\n%s", out)
+	}
 	dst.pull()
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 
@@ -69,18 +72,18 @@ func TestV2DuplicateAddConvergence(t *testing.T) {
 	}
 
 	// Fixed point: a rerun has nothing to do and pushes nothing.
-	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
 	if !strings.Contains(out, "nothing to do") {
 		t.Fatalf("rerun did not reach a fixed point:\n%s", out)
 	}
 }
 
-// TestV2PartialDriftThreeWay verifies that a patch whose context has
-// drifted at the destination merges three-way instead of failing: the
-// destination edits line 2 directly, the unsynced source commit edits
-// distant lines 8 and 9, and all changes must coexist afterwards.
-// (Adjacent-region edits remain genuine conflicts by git's merge rules;
-// that lifecycle is covered by TestV2SessionPauseResume.)
+// TestV2PartialDriftThreeWay verifies that a patch whose textual
+// context has drifted at the destination is rescued by three-way merge:
+// the destination edits line 5 — inside the hunk context of the source's
+// edit to lines 8-9 — so plain git am fails (verified against raw git),
+// while am --3way reconstructs the base tree from the patch's index
+// lines and merges both changes.
 func TestV2PartialDriftThreeWay(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -97,26 +100,30 @@ func TestV2PartialDriftThreeWay(t *testing.T) {
 	src.gritSync(dst, "-push", srcSpec, dstSpec)
 	dst.pull()
 
-	// The destination drifts line 2.
-	lines[1] = "dst2"
+	// The destination drifts line 5, inside the context of the source's
+	// upcoming hunk.
+	lines[4] = "dst5"
 	dst.write("f.txt", strings.Join(lines, "\n")+"\n")
-	dst.commit("destination drifts line 2")
+	dst.commit("destination drifts line 5")
 	dst.push()
 
-	// The source edits distant lines 8 and 9.
+	// The source edits lines 8 and 9.
 	lines[7] = "src8"
 	lines[8] = "src9"
-	lines[1] = "line2"
+	lines[4] = "line5"
 	src.write("proj/f.txt", strings.Join(lines, "\n")+"\n")
-	src.commit("source edits distant lines")
+	src.commit("source edits lines 8-9")
 	src.push()
 
-	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "conflict") {
+		t.Fatalf("three-way merge should have converged the drift:\n%s", out)
+	}
 	dst.pull()
 
 	got := strings.Split(strings.TrimSpace(dstRead(t, dst.dir, "f.txt")), "\n")
-	if got[1] != "dst2" || got[7] != "src8" || got[8] != "src9" {
-		t.Fatalf("three-way merge lost changes: lines 2,8,9 = %q %q %q", got[1], got[7], got[8])
+	if got[4] != "dst5" || got[7] != "src8" || got[8] != "src9" {
+		t.Fatalf("three-way merge lost changes: lines 5,8,9 = %q %q %q", got[4], got[7], got[8])
 	}
 }
 
@@ -318,5 +325,72 @@ func TestV2LegacyTagSuppressesReplay(t *testing.T) {
 	}
 	if !strings.Contains(out, "0 commits to copy") {
 		t.Fatalf("expected the legacy anchor to bound the selection:\n%s", out)
+	}
+}
+
+// TestV2FullyConvergedCommitSkipped verifies the whole-commit skip path:
+// a source commit whose every diff already matches the destination
+// creates no destination commit, is reported in the skip accounting, and
+// leaves the repository at a stable nothing-to-do fixed point.
+func TestV2FullyConvergedCommitSkipped(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// The destination already contains the change through a direct
+	// commit.
+	dst.write("only.txt", "already here\n")
+	dst.commit("direct destination commit")
+	dst.push()
+
+	// The source commit's sole diff is identical content.
+	src.write("proj/only.txt", "already here\n")
+	src.commit("fully converged source commit")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "skipping converged only.txt") {
+		t.Fatalf("converged diff was not pruned:\n%s", out)
+	}
+	if !strings.Contains(out, "1 commits skipped as already converged") {
+		t.Fatalf("skip accounting missing:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("fully converged commit should leave nothing to push:\n%s", out)
+	}
+	// No destination commit may exist for the skipped source commit.
+	tip := strings.TrimSpace(dst.gitOut("log", "-1", "--format=%B"))
+	if strings.Contains(tip, "fully converged source commit") {
+		t.Fatalf("empty destination commit was created for a converged source commit: %q", tip)
+	}
+}
+
+// TestV2UnbornSourceFailsLoudly documents the pre-existing contract that
+// grit cannot synchronize from a repository without any commits: Open
+// fails loudly at fetch ("couldn't find remote ref"), identical to
+// pristine upstream d3b81e6 behavior. Object seeding therefore only ever
+// runs for sources whose branch exists.
+func TestV2UnbornSourceFailsLoudly(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	cmd := exec.Command(src.gritBin,
+		"-config=user.name=test,user.email="+testAuthorEnv,
+		"-push", srcSpec, dstSpec)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("unborn source unexpectedly succeeded:\n%s", out)
+	}
+	if !strings.Contains(string(out), "couldn't find remote ref") {
+		t.Fatalf("expected a loud missing-branch failure:\n%s", out)
 	}
 }

@@ -236,11 +236,15 @@ func main() {
 
 	// Make the source repository's objects available in the destination
 	// clone, so that three-way merges have the pre-image blobs recorded
-	// by patches at their disposal. Dump mode never applies anything and
-	// must not touch the destination repository.
+	// by patches at their disposal. An unborn source branch (no commits
+	// yet) has nothing to seed and nothing to synchronize. Dump mode
+	// never applies anything and must not touch the destination
+	// repository.
 	if !*dump {
-		if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
-			log.Fatalf("fetch source objects: %v", err)
+		if _, err := src.Head(); err == nil {
+			if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
+				log.Fatalf("fetch source objects: %v", err)
+			}
 		}
 	}
 
@@ -292,6 +296,13 @@ func main() {
 		// ascending chronological order. So the last ID is the one we should sync
 		// from.
 		newestID := ids[len(ids)-1]
+		// Fail loudly when the anchor's source commit is no longer
+		// resolvable (rewritten or garbage-collected source history):
+		// depending on the git version, an unresolvable revision could
+		// otherwise degrade into an empty selection and a silent stall.
+		if _, err := src.RevParse(newestID + "^{commit}"); err != nil {
+			log.Fatalf("resume anchor %s does not resolve in %s: %v", newestID, src, err)
+		}
 		var err error
 		// Copy every source commit in newestID..srcBranch, not only those
 		// that descend from newestID: work merged into srcBranch from side
@@ -389,9 +400,11 @@ commitsLoop:
 		// are skipped without creating a destination commit; they carry
 		// no shipit tag, so they are simply re-examined (and re-pruned)
 		// on future runs until they become ancestors of an applied
-		// anchor. Note that this intentionally compares content only: a
-		// mode-only change with identical blobs would be pruned, but git
-		// does not record a distinct blob for such changes anyway.
+		// anchor. Content equality is the sole criterion: a pure mode
+		// change records no index line at all, so NewBlob reports !ok
+		// and such diffs are kept rather than pruned. In dump mode the
+		// same pruning applies, so the dump previews exactly what a
+		// real run would attempt.
 		var kept []git.Diff
 		for _, diff := range diffs {
 			newBlob, ok := diff.NewBlob()
@@ -427,7 +440,7 @@ commitsLoop:
 					log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
 					log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
 					log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
-					log.Printf("             git -C %s am --continue", dst.RepoRoot())
+					log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
 					log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
 				}
 				log.Fatalf("%s: apply %s: %s", dst, patch, err)
@@ -481,6 +494,13 @@ commitsLoop:
 	}
 }
 
+// processedSourceIDRe matches a shipit source id that stands alone on
+// its own line, the form grit writes and the anchor walk greps for.
+// Matching ids anywhere in a message body would let prose that quotes an
+// id silently exclude real source commits. Note Go regexp (RE2) syntax:
+// (?:fb)? is optional, not the BRE \? escape used by git's --grep.
+var processedSourceIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a-z0-9]+)$`)
+
 // processedSourceIDs returns the set of shipit source ids recorded in
 // the destination repository's history.
 func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
@@ -490,8 +510,8 @@ func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
 	}
 	processed := make(map[string]bool)
 	for _, c := range commits {
-		for _, id := range c.ShipitID() {
-			processed[id] = true
+		for _, match := range processedSourceIDRe.FindAllStringSubmatch(c.Body, -1) {
+			processed[match[1]] = true
 		}
 	}
 	return processed, nil

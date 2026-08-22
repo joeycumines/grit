@@ -145,20 +145,22 @@ func (r *Repo) InProgressAM() (bool, error) {
 }
 
 // IsAncestor reports whether ancestor is equal to or an ancestor of
-// descendant.
+// descendant. Both digests must resolve; with valid revisions, a
+// merge-base failure can only mean that the two commits are unrelated,
+// which is not ancestry.
 func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
-	_, err := r.git(nil, "merge-base", "--is-ancestor", ancestor, descendant)
-	if err == nil {
-		return true, nil
-	}
-	if strings.Contains(err.Error(), "exit status 1") {
+	out, err := r.git(nil, "merge-base", ancestor, descendant)
+	if err != nil {
 		return false, nil
 	}
-	return false, err
+	return strings.TrimSpace(string(out)) == ancestor, nil
 }
 
 // OriginHead returns the digest of the repository's remote tip for the
-// configured branch, as of the most recent Open.
+// configured branch, as of the most recent Open. The value is a
+// snapshot: a concurrent third-party push makes comparisons against it
+// stale, which is benign here — the next run re-syncs, and a stale push
+// fails loudly rather than silently.
 func (r *Repo) OriginHead() string {
 	return r.originHead
 }
@@ -183,7 +185,7 @@ func (r *Repo) RevParse(rev string) (string, error) {
 func (r *Repo) BlobHash(path string) (string, error) {
 	if _, err := os.Stat(filepath.Join(r.root, filepath.FromSlash(path))); err != nil {
 		if os.IsNotExist(err) {
-			return strings.Repeat("0", 40), nil
+			return zeroBlob, nil
 		}
 		return "", err
 	}
@@ -300,17 +302,18 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 		"--always", // to support empty commits
 		"--no-renames", "--no-stat", "--stdout",
 		"--format=", // diff content only
-		// Serialize binary deltas as applicable binary patches, rather
-		// than relying on git's default (which has changed across
-		// versions), so that git am can apply them everywhere.
-		"--binary",
+		// Serialize binary deltas as applicable binary patches, and
+		// record full (unabbreviated) blob digests in index lines, so
+		// that three-way merges reconstruct exact pre-images and
+		// post-images are comparable byte-for-byte.
+		"--binary", "--full-index",
 		"-1", id.Hex(),
 	)
 	if err != nil {
 		return Patch{}, err
 	}
 	raw, err := r.git(nil, "format-patch",
-		"--always", "--no-renames", "--no-stat", "--binary", "-1", id.Hex(), "--stdout")
+		"--always", "--no-renames", "--no-stat", "--binary", "--full-index", "-1", id.Hex(), "--stdout")
 	if err != nil {
 		return Patch{}, err
 	}
