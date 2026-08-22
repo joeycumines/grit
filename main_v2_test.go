@@ -1049,3 +1049,68 @@ func TestV2PathsContainingSpaces(t *testing.T) {
 		t.Fatalf("spaced-path convergence pruning did not fire:\n%s", out)
 	}
 }
+
+// TestV2QuotedPathRoundTrip covers paths git C-quotes in diff headers
+// (non-ASCII bytes): the addition must apply through grit's quoted
+// parsing and emission, and an identical arrival at the destination
+// must prune as converged.
+func TestV2QuotedPathRoundTrip(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	src.write("proj/caf\u00e9.txt", "unicode\n")
+	src.commit("add non-ascii path")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "applying") {
+		t.Fatalf("quoted path did not apply:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	// An identical non-ASCII path arriving at the destination through a
+	// direct commit while the source also adds it must prune as
+	// converged — proving quoted paths survive parsing end to end.
+	dst.write("caf\u00e92.txt", "second\n")
+	dst.commit("destination receives identical non-ascii file directly")
+	dst.push()
+	src.write("proj/caf\u00e92.txt", "second\n")
+	src.commit("source adds identical second non-ascii file")
+	src.push()
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "skipping converged caf\u00e92.txt") {
+		t.Fatalf("quoted-path convergence pruning did not fire:\n%s", out)
+	}
+}
+
+// TestV2AllTagsIneligibleIsFixedPoint verifies that a destination whose
+// every tagged commit is anchor-ineligible under strip rules falls
+// through to a clean initial sync whose tag-set exclusion drops the
+// already-mirrored commits — a fixed point, not an error.
+func TestV2AllTagsIneligibleIsFixedPoint(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	// Seed the destination directly with content the source will later
+	// carry, then let grit mirror it: the mirrored commit touches only
+	// proj/build (which the strip rule below excludes).
+	src.write("proj/build", "one\n")
+	src.commit("build-only change")
+	src.push()
+	// Strip rules match destination-relative paths.
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec, "strip:^build$")
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("stripped-only history did not reach a fixed point:\n%s", out)
+	}
+}

@@ -174,9 +174,48 @@ func (p Patch) MaybeContainsLFSPointer() bool {
 	return false
 }
 
-// quotePath renders a path in git's C-style quoted form.
+// quotePath renders a path in git's C-style quoted form using only the
+// escapes git's unquoting grammar accepts.
 func quotePath(p string) string {
-	return strconv.Quote(p)
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch c {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\a':
+			b.WriteString(`\a`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\v':
+			b.WriteString(`\v`)
+		default:
+			if c < 0x20 || c >= 0x7f {
+				fmt.Fprintf(&b, "\\%03o", c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// gitCUnquote decodes git's C-style quoted form, accepting the escapes
+// git emits plus common extensions.
+func gitCUnquote(s string) (string, error) {
+	return strconv.Unquote(s)
 }
 
 // hasControlChars reports whether the path contains characters that
@@ -297,16 +336,18 @@ var quotedDiffHeaderRe = regexp.MustCompile(`^diff --git ("a/.*") ("b/.*")$`)
 // exactly; the symmetric form is resolved by locating the " b/"
 // separator whose two halves agree.
 func parseDiffHeader(line []byte) (path []byte) {
-	rest := bytes.TrimPrefix(line, []byte("diff --git "))
-	if !bytes.HasPrefix(rest, []byte("a/")) {
-		return nil
-	}
+	// The C-quoted form must be tried first: it begins with a quote, so
+	// the symmetric branch's "a/" prefix test can never reach it.
 	if m := quotedDiffHeaderRe.FindSubmatch(line); m != nil {
-		unquoted, err := strconv.Unquote(string(m[1]))
+		unquoted, err := gitCUnquote(string(m[1]))
 		if err != nil {
 			return nil
 		}
 		return []byte(strings.TrimPrefix(unquoted, "a/"))
+	}
+	rest := bytes.TrimPrefix(line, []byte("diff --git "))
+	if !bytes.HasPrefix(rest, []byte("a/")) {
+		return nil
 	}
 	rest = rest[2:]
 	for i := 0; ; {

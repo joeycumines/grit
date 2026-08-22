@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -326,6 +327,8 @@ func (r *Repo) OriginHead() string {
 
 var ownLineShipitIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a-z0-9]+)$`)
 
+var ownLineGritTagRe = regexp.MustCompile(`(?m)^fbshipit-source-id: ([a-z0-9]+)$`)
+
 // OwnLineShipitIDs returns the shipit source ids recorded on their own
 // lines in the commit message — the form grit writes. Matching anywhere
 // in the body would let prose that quotes an id be mistaken for one;
@@ -335,6 +338,19 @@ var ownLineShipitIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a
 func (c *Commit) OwnLineShipitIDs() []string {
 	var ids []string
 	for _, match := range ownLineShipitIDRe.FindAllStringSubmatch(c.Body, -1) {
+		ids = append(ids, match[1])
+	}
+	return ids
+}
+
+// OwnLineGritTagIDs returns the subset of ids written flush-left with
+// the fb prefix — the exact serialization grit emits. Safety decisions
+// about grit-authored state use this stricter form: prose quotations
+// are conventionally indented or unprefixed, and a false positive here
+// would publish foreign state.
+func (c *Commit) OwnLineGritTagIDs() []string {
+	var ids []string
+	for _, match := range ownLineGritTagRe.FindAllStringSubmatch(c.Body, -1) {
 		ids = append(ids, match[1])
 	}
 	return ids
@@ -350,7 +366,7 @@ func (r *Repo) UnpushedCommitsAreGritAuthored(base string) (bool, error) {
 		return false, err
 	}
 	for _, c := range commits {
-		if len(c.OwnLineShipitIDs()) == 0 {
+		if len(c.OwnLineGritTagIDs()) == 0 {
 			return false, nil
 		}
 	}
@@ -585,6 +601,25 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 					path := []byte(fixPath(string(line[len(prefixA):])))
 					diff.Meta = append(diff.Meta, line[:len(prefixA)]...)
 					diff.Meta = append(diff.Meta, path...)
+					diff.Meta = append(diff.Meta, '\n')
+				case bytes.HasPrefix(line, []byte(`--- "a/`)), bytes.HasPrefix(line, []byte(`+++ "b/`)):
+					// C-quoted form: `--- "a/P"` / `+++ "b/P"`. The
+					// escaped path is decoded, rewritten, and re-emitted
+					// in git's exact quoting grammar.
+					escaped := strings.TrimSuffix(string(line[7:]), `"`)
+					unquoted, err := strconv.Unquote(`"` + escaped + `"`)
+					if err != nil {
+						diff.Meta = append(diff.Meta, line...)
+						diff.Meta = append(diff.Meta, '\n')
+						break
+					}
+					side := "a"
+					if bytes.HasPrefix(line, []byte("+++")) {
+						side = "b"
+					}
+					fixed := fixPath(unquoted)
+					diff.Meta = append(diff.Meta, line[:4]...)
+					diff.Meta = append(diff.Meta, []byte(quotePath(side+"/"+fixed))...)
 					diff.Meta = append(diff.Meta, '\n')
 				default:
 					diff.Meta = append(diff.Meta, line...)

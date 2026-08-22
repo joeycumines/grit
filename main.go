@@ -326,29 +326,19 @@ func main() {
 		}
 	} else {
 		log.Printf("synchronizing: last diff: %v, source: %v", lastCommit.Digest, lastCommit.ShipitID())
-		// Prefer ids recorded on their own line: the walk greps for
-		// exactly that form, and prose quotations elsewhere in the
-		// message must not choose the resume base.
+		// Prefer ids recorded on their own line; the body-wide scan is
+		// a logged fallback for hand-tagged anchors. Legacy anchors may
+		// carry abbreviations shorter than seven characters; git
+		// resolves them exactly as upstream did, so the exclusion set's
+		// length floor deliberately does not apply here.
 		ids := lastCommit.OwnLineShipitIDs()
 		if len(ids) == 0 {
-			log.Printf("anchor %s matched the grep but carries no own-line id; falling back to body-wide scan", lastCommit)
+			log.Printf("anchor %s carries no own-line id; scanning the body", lastCommit)
 			ids = lastCommit.ShipitID()
 		}
-		// Enforce the same minimum length as the exclusion set and
-		// strip-commit rules: shorter ids are untrustworthy anchors.
-		usable := ids[:0]
-		for _, id := range ids {
-			if len(id) >= 7 {
-				usable = append(usable, id)
-			}
+		if len(ids) == 0 {
+			log.Fatalf("no fbshipit-source-id found in commit: %+v", lastCommit)
 		}
-		if len(usable) == 0 {
-			log.Fatalf("no fbshipit-source-id of at least 7 characters found in commit: %+v", lastCommit)
-		}
-		ids = usable
-		// When a commit is a squash of multiple commits, they are sorted in
-		// ascending chronological order. So the last ID is the one we should sync
-		// from.
 		newestID := ids[len(ids)-1]
 		// Fail loudly when the anchor's source commit is no longer
 		// resolvable (rewritten or garbage-collected source history):
