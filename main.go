@@ -330,6 +330,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("isCommitApplicable %s: %v", last[0], err)
 		}
+		if !applies {
+			// An empty anchor commit (a pure resume marker recording a
+			// source revision without any content change) is a valid
+			// synchronization point.
+			if empty, eerr := dst.PatchIsEmpty(last[0].Digest.Hex()); eerr == nil && empty {
+				lastCommit = last[0]
+				break
+			}
+		}
 		if applies {
 			lastCommit = last[0]
 			break

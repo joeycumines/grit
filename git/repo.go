@@ -720,6 +720,17 @@ func (r *Repo) Apply(patch Patch) error {
 	return err
 }
 
+// PatchIsEmpty reports whether the commit named by the provided digest
+// contains no file changes (--always format-patch emits headers even
+// for empty commits).
+func (r *Repo) PatchIsEmpty(id string) (bool, error) {
+	out, err := r.git(nil, "format-patch", "--always", "-1", id, "--stdout")
+	if err != nil {
+		return false, err
+	}
+	return !bytes.Contains(out, []byte("diff --git")), nil
+}
+
 // CommitEmptyWithMessageFile creates an empty commit whose message is
 // read from the provided repository-relative file, preserving the
 // record of an applied patch that produced no changes.
