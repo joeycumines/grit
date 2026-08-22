@@ -236,15 +236,12 @@ func main() {
 
 	// Make the source repository's objects available in the destination
 	// clone, so that three-way merges have the pre-image blobs recorded
-	// by patches at their disposal. An unborn source branch (no commits
-	// yet) has nothing to seed and nothing to synchronize. Dump mode
-	// never applies anything and must not touch the destination
-	// repository.
+	// by patches at their disposal. Open guarantees a resolvable source
+	// branch by this point. Dump mode never applies anything and must
+	// not touch the destination repository.
 	if !*dump {
-		if _, err := src.Head(); err == nil {
-			if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
-				log.Fatalf("fetch source objects: %v", err)
-			}
+		if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
+			log.Fatalf("fetch source objects: %v", err)
 		}
 	}
 
@@ -300,7 +297,7 @@ func main() {
 		var err error
 		// Topological order guarantees that every commit is applied after
 		// its ancestors, regardless of authorship dates or merges.
-		commits, err = src.Log("--no-merges", "--topo-order")
+		commits, err = src.Log("--no-merges", "--topo-order", "--full-history")
 		if err != nil {
 			log.Fatalf("log %s: %v", src, err)
 		}
@@ -326,22 +323,28 @@ func main() {
 		// that descend from newestID: work merged into srcBranch from side
 		// branches ("Merge branch 'wip'") does not descend from an older tip
 		// of srcBranch, and must not be silently skipped. --topo-order keeps
-		// parents ahead of children so patches apply in dependency order.
-		commits, err = src.Log(newestID+".."+srcBranch, "--topo-order", "--no-merges")
+		// parents ahead of children so patches apply in dependency order,
+		// and --full-history defeats git's default history simplification,
+		// which would otherwise hide commits whose prefix effect duplicates
+		// a surviving merge parent's tree.
+		commits, err = src.Log(newestID+".."+srcBranch, "--topo-order", "--no-merges", "--full-history")
 		if err != nil {
 			log.Fatalf("log %s: %v", src, err)
 		}
 	}
 
 	// Filter out commits which are themselves copies, so that
-	// we can properly support multi-way syncing.
+	// we can properly support multi-way syncing. Own-line matching is
+	// required: a source message merely quoting another mirror's id in
+	// prose must not cause its changes to be silently dropped.
 	// We also filter out commits that match any stripped commits.
 	raw := commits
 	commits = nil
 commitsLoop:
 	for _, commit := range raw {
-		if len(commit.ShipitID()) > 0 {
-			continue
+		if ids := commit.OwnLineShipitIDs(); len(ids) > 0 {
+			log.Printf("skipping %s: already carries shipit source id(s) %v", commit, ids)
+			continue commitsLoop
 		}
 		if rules.isStripped(commit) {
 			log.Debug.Printf("commit %s: stripped by strip-commit rule", commit.Digest)
@@ -421,20 +424,26 @@ commitsLoop:
 		// on future runs until they become ancestors of an applied
 		// anchor. Content equality is the sole criterion: a pure mode
 		// change records no index line at all, so NewBlob reports !ok
-		// and such diffs are kept rather than pruned. In dump mode the
-		// same pruning applies, so the dump previews exactly what a
-		// real run would attempt.
+		// and such diffs are kept rather than pruned. Dump mode skips
+		// pruning entirely: it previews the unpruned candidate set from
+		// the source side only, since it cannot know the destination
+		// state that a real run will have built up when it reaches each
+		// patch.
 		var kept []git.Diff
-		for _, diff := range diffs {
-			newBlob, ok := diff.NewBlob()
-			if ok {
-				curBlob, err := dst.BlobHash(diff.Path)
-				if err == nil && curBlob == newBlob {
-					log.Printf("skipping converged %s in %s", diff.Path, c)
-					continue
+		if *dump {
+			kept = diffs
+		} else {
+			for _, diff := range diffs {
+				newBlob, ok := diff.NewBlob()
+				if ok {
+					curBlob, err := dst.BlobHash(diff.Path)
+					if err == nil && curBlob == newBlob {
+						log.Printf("skipping converged %s in %s", diff.Path, c)
+						continue
+					}
 				}
+				kept = append(kept, diff)
 			}
-			kept = append(kept, diff)
 		}
 		if len(kept) == 0 {
 			nskipped++

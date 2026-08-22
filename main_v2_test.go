@@ -18,16 +18,21 @@ import (
 var regexpFullDigest = regexp.MustCompile(`fbshipit-source-id: [0-9a-f]{40}`)
 
 // gritCloneDir computes the local clone directory that grit's git.Open
-// derives for the provided repository URL, so that tests can inspect (and
-// resolve) paused sessions. Must be called after TEST_TMPDIR has been set.
-// This mirrors the derivation in git/repo.go's Open (basename minus
-// extension plus the first four bytes of sha256(url)); if Open ever
-// changes its formula, this helper must change with it.
-func gritCloneDir(t *testing.T, url string) string {
+// derives for the provided endpoint (url, prefix, branch), so that tests
+// can inspect (and resolve) paused sessions. Must be called after
+// TEST_TMPDIR has been set. This mirrors the derivation in git/repo.go's
+// Open; if Open ever changes its formula, this helper must change with it.
+func gritCloneDir(t *testing.T, url, prefix, branch string) string {
 	t.Helper()
 	base := filepath.Base(url)
 	base = strings.TrimSuffix(base, filepath.Ext(base))
-	sum := sha256.Sum256([]byte(url))
+	h := sha256.New()
+	h.Write([]byte(url))
+	h.Write([]byte{0})
+	h.Write([]byte(prefix))
+	h.Write([]byte{0})
+	h.Write([]byte(branch))
+	sum := h.Sum(nil)
 	return filepath.Join(os.Getenv("TEST_TMPDIR"), "grit",
 		fmt.Sprintf("%s%02x%02x%02x%02x", base, sum[0], sum[1], sum[2], sum[3]))
 }
@@ -159,7 +164,7 @@ func TestV2SessionPauseResume(t *testing.T) {
 	if !strings.Contains(out, "conflict") {
 		t.Fatalf("expected a conflict, got:\n%s", out)
 	}
-	clone := gritCloneDir(t, dst.bare)
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
 	if _, err := os.Stat(filepath.Join(clone, ".git", "rebase-apply")); err != nil {
 		t.Fatalf("session not paused in clone: %v", err)
 	}
@@ -396,10 +401,14 @@ func TestV2FullyConvergedCommitSkipped(t *testing.T) {
 		t.Fatalf("empty destination commit was created for a converged source commit: %q", tip)
 	}
 
-	// Dump mode previews the same pruning.
+	// Dump mode previews the unpruned candidate set from the source side
+	// only: pruning is state-dependent and therefore deliberately absent.
 	dump := gritDumpOutput(t, src.gritBin, srcSpec, dstSpec)
-	if !strings.Contains(dump, "skipping converged only.txt") {
-		t.Fatalf("dump mode did not preview convergence pruning:\n%s", dump)
+	if !strings.Contains(dump, "b/only.txt") {
+		t.Fatalf("dump mode did not include the converged commit's diff:\n%s", dump)
+	}
+	if strings.Contains(dump, "skipping converged") {
+		t.Fatalf("dump mode should not apply destination-state-dependent pruning:\n%s", dump)
 	}
 
 	// Converged commits are re-examined on every run rather than
@@ -470,7 +479,7 @@ func TestV2PauseWithoutPushThenPushLater(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Fatalf("expected a conflicting non-push run to fail:\n%s", out)
 	}
-	clone := gritCloneDir(t, dst.bare)
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
 	if _, err := os.Stat(filepath.Join(clone, ".git", "rebase-apply")); err != nil {
 		t.Fatalf("session not paused: %v", err)
 	}
@@ -489,5 +498,68 @@ func TestV2PauseWithoutPushThenPushLater(t *testing.T) {
 	dst.pull()
 	if got := dstRead(t, dst.dir, "f.txt"); got != "resolved7\n" {
 		t.Fatalf("resolved content did not land at destination: %q", got)
+	}
+}
+
+// TestV2FullHistorySelectionSeesMergeHiddenCommits pins the defeat of
+// git's default history simplification: a side-branch commit whose
+// prefix effect duplicates the surviving merge parent's tree would be
+// hidden from a plain prefixed `git log A..B` (the same silent-skip
+// signature the selection fix exists to prevent). With --full-history
+// the commit must appear in the run — here as pruned-converged, since
+// its content landed through the mainline duplicate.
+func TestV2FullHistorySelectionSeesMergeHiddenCommits(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// The identical file is added on both a side branch and mainline.
+	src.git("checkout", "-b", "side")
+	src.write("proj/dup.txt", "X")
+	src.commit("sibling adds duplicate")
+	src.git("checkout", testBranch)
+	src.write("proj/dup.txt", "X")
+	src.commit("mainline adds duplicate")
+	src.git("merge", "--no-ff", "-m", "merge side", "side")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "sibling adds duplicate") {
+		t.Fatalf("history simplification hid the sibling commit:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+}
+
+// TestV2ForeignUnpushedStateAborts verifies that unpushed commits in the
+// destination clone that grit did not author (no shipit id at HEAD) abort
+// the run loudly instead of being preserved and later published.
+func TestV2ForeignUnpushedStateAborts(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Stray, non-grit work left in grit's own clone, ahead of origin.
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
+	runGit(t, clone, "-c", "user.email=t@e", "-c", "user.name=t",
+		"commit", "--allow-empty", "-m", "stray local commit")
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "without a grit shipit id") {
+		t.Fatalf("foreign unpushed state did not abort loudly:\n%s", out)
 	}
 }

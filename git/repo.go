@@ -68,8 +68,16 @@ type Repo struct {
 func Open(url, prefix, branch string) (*Repo, error) {
 	base := filepath.Base(url)
 	base = strings.TrimSuffix(base, filepath.Ext(base))
+	// Key the cache by everything that changes the clone's semantics:
+	// two configurations sharing a URL but differing in branch or prefix
+	// must not share a working clone, or preservation logic could carry
+	// one configuration's unpushed state into the other's push.
 	h := sha256.New()
 	h.Write([]byte(url))
+	h.Write([]byte{0})
+	h.Write([]byte(prefix))
+	h.Write([]byte{0})
+	h.Write([]byte(branch))
 	b := h.Sum(nil)
 	os.MkdirAll(Dir, 0700)
 	path := filepath.Join(Dir, fmt.Sprintf("%s%02x%02x%02x%02x", base, b[0], b[1], b[2], b[3]))
@@ -218,17 +226,31 @@ func (r *Repo) RevParse(rev string) (string, error) {
 
 // BlobHash returns the git blob digest of the file at the provided
 // repository-relative working tree path. Deleted files hash to the zero
-// digest, mirroring the index line of git diffs. Symbolic links hash
-// their target path text via git's own machinery, matching how git
-// stores links. The zero digest is also the sentinel used for
-// sha256-object-format repositories' deletion lines under the SHA1
-// digester; such repositories fail loudly elsewhere.
+// digest, mirroring the index line of git diffs. Symbolic links are
+// hashed by their link text (what git stores), including broken links,
+// so deletions of broken symlinks are never mistaken for converged
+// deletions. The zero digest sentinel also documents behavior for
+// sha256-object-format repositories under the SHA1 digester; such
+// repositories fail loudly elsewhere.
 func (r *Repo) BlobHash(path string) (string, error) {
-	if _, err := os.Stat(filepath.Join(r.root, filepath.FromSlash(path))); err != nil {
+	full := filepath.Join(r.root, filepath.FromSlash(path))
+	fi, err := os.Lstat(full)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return zeroBlob, nil
 		}
 		return "", err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(full)
+		if err != nil {
+			return "", err
+		}
+		out, err := r.git([]byte(target), "hash-object", "--stdin")
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
 	}
 	out, err := r.git(nil, "hash-object", "--", path)
 	if err != nil {
