@@ -380,17 +380,28 @@ func (r *Repo) RevParse(rev string) (string, error) {
 // filesystem's case sensitivity; an incoming addition colliding with an
 // untracked leftover instead fails loudly at application time.
 func (r *Repo) HeadEntry(path string) (digest, mode string, err error) {
-	out, err := r.git(nil, "ls-tree", "HEAD", "--", path)
+	// :(literal) disables pathspec globbing so metacharacters in file
+	// names cannot alias sibling entries; tree reads are case-exact and
+	// reflect committed state only.
+	out, err := r.git(nil, "ls-tree", "HEAD", "--", ":(literal)"+path)
 	if err != nil {
 		return "", "", err
 	}
-	line := strings.TrimSpace(string(out))
-	if line == "" {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
 		return zeroBlob, "", nil
 	}
-	fields := strings.Fields(strings.SplitN(line, "\t", 2)[0])
+	if len(lines) > 1 {
+		return "", "", fmt.Errorf("path %s is ambiguous in HEAD's tree (%d entries)", path, len(lines))
+	}
+	fields := strings.Fields(strings.SplitN(lines[0], "\t", 2)[0])
 	if len(fields) < 3 {
-		return "", "", fmt.Errorf("malformed ls-tree output for %s: %q", path, line)
+		return "", "", fmt.Errorf("malformed ls-tree output for %s: %q", path, lines[0])
 	}
 	return fields[2], fields[0], nil
 }

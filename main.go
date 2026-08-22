@@ -369,6 +369,17 @@ func main() {
 		}
 	}
 
+	// The anchor walk greps with a BRE pattern; a git built without the
+	// GNU-flavored extensions it uses would find no anchor even though
+	// ids exist. processedSourceIDs reads the same bodies with Go's own
+	// engine, so any disagreement is a detectable environment problem
+	// rather than a silent full-replay degradation.
+	if lastCommit == nil {
+		if processed, err := processedSourceIDs(dst); err == nil && len(processed) > 0 {
+			log.Fatalf("destination records %d shipit source id(s) but the anchor search matched none; git's regex support appears incompatible with this grit build", len(processed))
+		}
+	}
+
 	// Filter out commits which are themselves copies, so that
 	// we can properly support multi-way syncing. Own-line matching is
 	// required: a source message merely quoting another mirror's id in
