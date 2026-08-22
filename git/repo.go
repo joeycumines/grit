@@ -80,7 +80,9 @@ func Open(url, prefix, branch string) (*Repo, error) {
 	h.Write([]byte(branch))
 	b := h.Sum(nil)
 	os.MkdirAll(Dir, 0700)
-	path := filepath.Join(Dir, fmt.Sprintf("%s%02x%02x%02x%02x", base, b[0], b[1], b[2], b[3]))
+	// 128 bits of digest make cross-configuration collisions negligible
+	// while keeping directory names reasonably short.
+	path := filepath.Join(Dir, fmt.Sprintf("%s%x", base, b[:16]))
 	_, err := os.Stat(path)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
@@ -309,7 +311,7 @@ func (r *Repo) Configure(key, value string) {
 }
 
 // Log returns a set of commit objects representing the "git log" operation
-// with the provided arguments.
+// with the provided arguments, restricted to the repository's path prefix.
 func (r *Repo) Log(args ...string) (commits []*Commit, err error) {
 	args = append([]string{"log"}, args...)
 	if r.prefix != "" {
@@ -318,11 +320,30 @@ func (r *Repo) Log(args ...string) (commits []*Commit, err error) {
 	out, err := r.git(nil, args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "path not in the working tree") {
-			// Allow missing destination directory.
+			// Allow a missing destination directory, but say so: a
+			// silently empty result here would otherwise degrade
+			// prefix-scoped callers into full replays.
+			log.Printf("%s: prefix %q is absent; treating log as empty", r.root, r.prefix)
 			return nil, nil
 		}
 		return nil, err
 	}
+	return parseCommits(r, out)
+}
+
+// LogIgnoringPrefix behaves like Log but is never restricted to the
+// repository's path prefix. Message-level state (such as shipit source
+// ids) must be read through this method: worktree-dependent pathspecs
+// would silently empty it when the prefix subtree is absent.
+func (r *Repo) LogIgnoringPrefix(args ...string) ([]*Commit, error) {
+	out, err := r.git(nil, append([]string{"log"}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	return parseCommits(r, out)
+}
+
+func parseCommits(r *Repo, out []byte) (commits []*Commit, err error) {
 	err = foreach(out, "commit", func(commit []byte) error {
 		c := &Commit{repo: r}
 		headers := scan(&commit, "\n")

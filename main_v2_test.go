@@ -34,7 +34,7 @@ func gritCloneDir(t *testing.T, url, prefix, branch string) string {
 	h.Write([]byte(branch))
 	sum := h.Sum(nil)
 	return filepath.Join(os.Getenv("TEST_TMPDIR"), "grit",
-		fmt.Sprintf("%s%02x%02x%02x%02x", base, sum[0], sum[1], sum[2], sum[3]))
+		fmt.Sprintf("%s%x", base, sum[:16]))
 }
 
 // TestV2DuplicateAddConvergence replicates the eventloop fuzz-testdata
@@ -561,5 +561,97 @@ func TestV2ForeignUnpushedStateAborts(t *testing.T) {
 	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
 	if !strings.Contains(out, "without a grit shipit id") {
 		t.Fatalf("foreign unpushed state did not abort loudly:\n%s", out)
+	}
+}
+
+// TestV2ProseQuotedIdDoesNotDropCommit pins the own-line rule for the
+// copy filter: a source commit whose message merely quotes a shipit id
+// mid-prose must still be mirrored, changes and all.
+func TestV2ProseQuotedIdDoesNotDropCommit(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	src.write("proj/prose.txt", "content\n")
+	src.commit("reverts the change recorded as shipit-source-id: 05220186 mid-sentence")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "applying") {
+		t.Fatalf("prose-quoted id caused the commit to be dropped:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+}
+
+// writeSymlink creates a symbolic link in the working clone.
+func (r *gritRepo) writeSymlink(path, target string) {
+	r.t.Helper()
+	full := filepath.Join(r.dir, path)
+	if err := os.MkdirAll(filepath.Dir(full), 0777); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := os.Symlink(target, full); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// TestV2SymlinkConvergenceAndDeletion covers BlobHash's link-text
+// hashing end to end: an identically re-added symlink is pruned as
+// converged (hashing through the target would never match), and a
+// broken symlink's deletion applies instead of being falsely pruned.
+func TestV2SymlinkConvergenceAndDeletion(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "target content\n")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// The destination adds a symlink directly; an identical source-side
+	// addition must prune as converged.
+	dst.writeSymlink("lnk", "base.txt")
+	dst.commit("destination adds symlink")
+	dst.push()
+	src.writeSymlink("proj/lnk", "base.txt")
+	src.commit("source adds identical symlink")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "skipping converged lnk") {
+		t.Fatalf("symlink convergence pruning did not fire:\n%s", out)
+	}
+	dst.pull()
+
+	// A broken symlink arrives at both sides, then the source deletes
+	// it: the deletion must apply rather than be pruned as already
+	// converged (the broken link exists at the destination).
+	src.writeSymlink("proj/broken.lnk", "nowhere")
+	src.commit("add broken symlink")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	runGit(t, src.dir, "rm", "proj/broken.lnk")
+	src.commit("delete broken symlink")
+	src.push()
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "applying") {
+		t.Fatalf("deletion of broken symlink was not applied:\n%s", out)
+	}
+	dst.pull()
+	if _, err := os.Lstat(filepath.Join(dst.dir, "broken.lnk")); !os.IsNotExist(err) {
+		t.Fatalf("broken symlink still present at destination: %v", err)
 	}
 }

@@ -237,8 +237,9 @@ func main() {
 	// Make the source repository's objects available in the destination
 	// clone, so that three-way merges have the pre-image blobs recorded
 	// by patches at their disposal. Open guarantees a resolvable source
-	// branch by this point. Dump mode never applies anything and must
-	// not touch the destination repository.
+	// branch by this point. Dump mode never applies patches or pushes;
+	// like every run it still refreshes its repository clones, and it is
+	// subject to the preservation gate on foreign unpushed state.
 	if !*dump {
 		if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
 			log.Fatalf("fetch source objects: %v", err)
@@ -247,8 +248,9 @@ func main() {
 
 	// A paused session takes priority over everything else: selection
 	// and convergence pruning must not make decisions against a worktree
-	// holding unresolved conflict markers. Dump mode remains read-only
-	// analysis and is exempt.
+	// holding unresolved conflict markers. Dump mode applies nothing and
+	// no longer consults destination state, so it may proceed for
+	// read-only inspection of the candidate set.
 	if !*dump {
 		if inProgress, err := dst.InProgressAM(); err != nil {
 			log.Fatal(err)
@@ -273,7 +275,9 @@ func main() {
 	// in the source and destination repositories.
 	var lastCommit *git.Commit
 	for head := "HEAD"; ; {
-		last, err := dst.Log("-1", "--grep", `^\s*\(fb\)\?shipit-source-id: [a-z0-9]\+$`, head)
+		// The anchor is message-level state: it must be found even when
+		// the destination prefix subtree is absent from the worktree.
+		last, err := dst.LogIgnoringPrefix("-1", "--grep", `^\s*\(fb\)\?shipit-source-id: [a-z0-9]\+$`, head)
 		if err != nil {
 			log.Fatalf("log %s: %v", dst, err)
 		}
@@ -485,13 +489,21 @@ commitsLoop:
 			// Copy any LFS objects that were touched by this change.
 			// Doing it this way allows us to download only LFS objects
 			// that actually need to be transferred.
-			paths := patch.Paths()
+			// Patch paths are destination-relative (the source prefix
+			// was rewritten); LFS pointer paths are source-relative.
+			// Match in source-relative space so that prefixed
+			// destinations are not silently skipped.
+			dstPrefix := dst.Prefix()
+			srcRelative := make(map[string]bool, len(patch.Diffs))
+			for _, diff := range patch.Diffs {
+				srcRelative[strings.TrimPrefix(diff.Path, dstPrefix)] = true
+			}
 			ptrs, err := dst.ListLFSPointers()
 			if err != nil {
 				log.Fatal(err)
 			}
 			for _, ptr := range ptrs {
-				if !paths[ptr] {
+				if !srcRelative[ptr] {
 					continue
 				}
 				if err := dst.CopyLFSObject(src, ptr); err != nil {
@@ -541,7 +553,10 @@ commitsLoop:
 // characters are trusted, mirroring strip-commit's minimum: shorter ids
 // would exclude disproportionately large slices of the digest space.
 func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
-	commits, err := dst.Log()
+	// Tag state is message-level; a prefix pathspec would silently empty
+	// the set whenever the prefix subtree is absent from the worktree,
+	// defeating exactly-once exclusion and degrading to full replays.
+	commits, err := dst.LogIgnoringPrefix()
 	if err != nil {
 		return nil, err
 	}
