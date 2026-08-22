@@ -120,6 +120,15 @@ func Open(url, prefix, branch string) (*Repo, error) {
 		return nil, err
 	}
 	if !ahead {
+		// Only grit-authored state (a shipit id at HEAD, as written for
+		// every commit grit creates) may be preserved for a later push.
+		authored, err := r.HeadIsGritAuthored()
+		if err != nil {
+			return nil, err
+		}
+		if !authored {
+			return nil, fmt.Errorf("%s holds unpushed commits without a grit shipit id at HEAD; this is not grit-authored state -- inspect the repository and remove or explicitly adopt them before synchronizing", r.root)
+		}
 		log.Printf("preserving %s: local commits from a resolved session have not been pushed yet", r.root)
 		return r, nil
 	}
@@ -147,7 +156,9 @@ func (r *Repo) InProgressAM() (bool, error) {
 // IsAncestor reports whether ancestor is equal to or an ancestor of
 // descendant. Both digests must resolve; with valid revisions, a
 // merge-base failure can only mean that the two commits are unrelated,
-// which is not ancestry.
+// which is not ancestry. (A transient git failure would also map to
+// "not ancestor"; the consequence is a preserved tree and a later push,
+// never data loss.)
 func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
 	out, err := r.git(nil, "merge-base", ancestor, descendant)
 	if err != nil {
@@ -163,6 +174,32 @@ func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
 // fails loudly rather than silently.
 func (r *Repo) OriginHead() string {
 	return r.originHead
+}
+
+var ownLineShipitIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a-z0-9]+)$`)
+
+// OwnLineShipitIDs returns the shipit source ids recorded on their own
+// lines in the commit message — the form grit writes. Matching anywhere
+// in the body would let prose that quotes an id be mistaken for one;
+// note that Log dedents four-space-indented lines, so indented
+// quotations of ids remain an accepted residual ambiguity shared with
+// ShipitID.
+func (c *Commit) OwnLineShipitIDs() []string {
+	var ids []string
+	for _, match := range ownLineShipitIDRe.FindAllStringSubmatch(c.Body, -1) {
+		ids = append(ids, match[1])
+	}
+	return ids
+}
+
+// HeadIsGritAuthored reports whether HEAD carries a shipit source id,
+// marking it as state grit itself created.
+func (r *Repo) HeadIsGritAuthored() (bool, error) {
+	commits, err := r.Log("-1", "HEAD")
+	if err != nil {
+		return false, err
+	}
+	return len(commits) == 1 && len(commits[0].OwnLineShipitIDs()) > 0, nil
 }
 
 // Head returns the digest of the commit HEAD refers to.
@@ -181,7 +218,11 @@ func (r *Repo) RevParse(rev string) (string, error) {
 
 // BlobHash returns the git blob digest of the file at the provided
 // repository-relative working tree path. Deleted files hash to the zero
-// digest, mirroring the index line of git diffs.
+// digest, mirroring the index line of git diffs. Symbolic links hash
+// their target path text via git's own machinery, matching how git
+// stores links. The zero digest is also the sentinel used for
+// sha256-object-format repositories' deletion lines under the SHA1
+// digester; such repositories fail loudly elsewhere.
 func (r *Repo) BlobHash(path string) (string, error) {
 	if _, err := os.Stat(filepath.Join(r.root, filepath.FromSlash(path))); err != nil {
 		if os.IsNotExist(err) {

@@ -20,6 +20,9 @@ var regexpFullDigest = regexp.MustCompile(`fbshipit-source-id: [0-9a-f]{40}`)
 // gritCloneDir computes the local clone directory that grit's git.Open
 // derives for the provided repository URL, so that tests can inspect (and
 // resolve) paused sessions. Must be called after TEST_TMPDIR has been set.
+// This mirrors the derivation in git/repo.go's Open (basename minus
+// extension plus the first four bytes of sha256(url)); if Open ever
+// changes its formula, this helper must change with it.
 func gritCloneDir(t *testing.T, url string) string {
 	t.Helper()
 	base := filepath.Base(url)
@@ -161,10 +164,17 @@ func TestV2SessionPauseResume(t *testing.T) {
 		t.Fatalf("session not paused in clone: %v", err)
 	}
 
-	// A fresh invocation must preserve the paused session.
+	// A fresh invocation must preserve the paused session and refuse to
+	// make pruning decisions against the conflicted worktree.
 	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
-	if strings.Contains(out, "nothing to do") || !fileContains(t, filepath.Join(clone, "f.txt"), "ours7") {
-		t.Fatalf("paused session was not preserved across invocations:\n%s", out)
+	if !strings.Contains(out, "resuming interrupted git am session") {
+		t.Fatalf("paused session was not resumed:\n%s", out)
+	}
+	if !strings.Contains(out, "resolution is still pending") {
+		t.Fatalf("pending session did not short-circuit selection:\n%s", out)
+	}
+	if !fileContains(t, filepath.Join(clone, "f.txt"), "ours7") {
+		t.Fatal("paused worktree was disturbed")
 	}
 
 	// Resolve manually and continue the session.
@@ -193,6 +203,20 @@ func gritOutput(t *testing.T, bin, srcSpec, dstSpec string) string {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Logf("grit exited non-zero (expected when pausing):\n%s", out)
+	}
+	return string(out)
+}
+
+// gritDumpOutput runs grit in -dump mode (no application, no push) and
+// returns its combined output.
+func gritDumpOutput(t *testing.T, bin, srcSpec, dstSpec string) string {
+	t.Helper()
+	cmd := exec.Command(bin,
+		"-config=user.name=test,user.email="+testAuthorEnv,
+		"-dump", srcSpec, dstSpec)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("grit -dump failed: %v\n%s", err, out)
 	}
 	return string(out)
 }
@@ -288,12 +312,13 @@ func TestV2TagSetExclusionExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestV2LegacyTagSuppressesReplay verifies that a destination commit
-// carrying a legacy abbreviated (7-hex) shipit id anchors the resume and
-// suppresses replay of its source commit, matching the anchor walk's
-// long-standing semantics. Prefix matching for legacy ids that exclude
+// TestV2LegacyAbbreviatedAnchorSuppressesReplay verifies that a
+// destination commit carrying a legacy abbreviated (7-hex) shipit id
+// resolves as the resume anchor, bounding the selection range so its
+// source commit is not replayed. Prefix-matching of abbreviated ids
+// during tag-set exclusion is covered by TestIsProcessed. Prefix matching for legacy ids that exclude
 // non-ancestor commits is covered by TestIsProcessed.
-func TestV2LegacyTagSuppressesReplay(t *testing.T) {
+func TestV2LegacyAbbreviatedAnchorSuppressesReplay(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -370,6 +395,25 @@ func TestV2FullyConvergedCommitSkipped(t *testing.T) {
 	if strings.Contains(tip, "fully converged source commit") {
 		t.Fatalf("empty destination commit was created for a converged source commit: %q", tip)
 	}
+
+	// Dump mode previews the same pruning.
+	dump := gritDumpOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(dump, "skipping converged only.txt") {
+		t.Fatalf("dump mode did not preview convergence pruning:\n%s", dump)
+	}
+
+	// Converged commits are re-examined on every run rather than
+	// permanently skipped: once the destination diverges from the source
+	// commit's post-image, the diff stops being prunable and the commit
+	// is genuinely reconsidered. For an identical-path content conflict
+	// that reconsideration surfaces loudly.
+	dst.write("only.txt", "diverged\n")
+	dst.commit("destination diverges")
+	dst.push()
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "conflict") {
+		t.Fatalf("re-examined converged commit after divergence should surface loudly:\n%s", out)
+	}
 }
 
 // TestV2UnbornSourceFailsLoudly documents the pre-existing contract that
@@ -392,5 +436,58 @@ func TestV2UnbornSourceFailsLoudly(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "couldn't find remote ref") {
 		t.Fatalf("expected a loud missing-branch failure:\n%s", out)
+	}
+}
+
+// TestV2PauseWithoutPushThenPushLater verifies that a conflict paused by
+// a plain (non -push) run persists for resolution, and that a later
+// push-enabled run publishes the resolved session — the other half of
+// the preservation heuristic.
+func TestV2PauseWithoutPushThenPushLater(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/f.txt", "line7\n")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Conflict without -push: application still happens, so the session
+	// pauses exactly as it would with -push.
+	dst.write("f.txt", "ours7\n")
+	dst.commit("destination change")
+	dst.push()
+	src.write("proj/f.txt", "theirs7\n")
+	src.commit("source change")
+	src.push()
+
+	cmd := exec.Command(src.gritBin,
+		"-config=user.name=test,user.email="+testAuthorEnv,
+		srcSpec, dstSpec)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected a conflicting non-push run to fail:\n%s", out)
+	}
+	clone := gritCloneDir(t, dst.bare)
+	if _, err := os.Stat(filepath.Join(clone, ".git", "rebase-apply")); err != nil {
+		t.Fatalf("session not paused: %v", err)
+	}
+
+	// Resolve and continue; the state must remain unpushed.
+	if err := os.WriteFile(filepath.Join(clone, "f.txt"), []byte("resolved7\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, clone, "add", "f.txt")
+	runGit(t, clone, "-c", "core.editor=true", "am", "--continue")
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "pushing previously resolved session") {
+		t.Fatalf("later push-enabled run did not publish the resolved session:\n%s", out)
+	}
+	dst.pull()
+	if got := dstRead(t, dst.dir, "f.txt"); got != "resolved7\n" {
+		t.Fatalf("resolved content did not land at destination: %q", got)
 	}
 }

@@ -176,21 +176,21 @@ func main() {
 			}
 			rules.stripMessagePaths = append(rules.stripMessagePaths, r)
 		case "strip-commit":
-			hash := parts[1]
+			// Digests are matched against the lowercase hex produced by
+			// git; normalize and validate here so that uppercase input
+			// is not silently accepted and then never matched.
+			hash := strings.ToLower(parts[1])
 			if len(hash) < 7 {
 				log.Fatalf("invalid commit prefix %s: must have at least 7 digits", parts[1])
 			}
 			for _, d := range hash {
-				if (d < '0' || d > '9') && (d < 'a' || d > 'f') && (d < 'A' || d > 'F') {
+				if (d < '0' || d > '9') && (d < 'a' || d > 'f') {
 					log.Fatalf("invalid commit prefix %s: invalid hex digit %c", hash, d)
 				}
 			}
 			rules.stripCommits = append(rules.stripCommits, hash)
 		case "rewrite":
 			rules.rewrite = append(rules.rewrite, parseRewriteRule(parts[1]))
-			if len(parts) != 2 {
-				log.Fatalf("invalid rule %s", rule)
-			}
 		default:
 			log.Fatalf("invalid rule type %s", parts[0])
 		}
@@ -245,6 +245,24 @@ func main() {
 			if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
 				log.Fatalf("fetch source objects: %v", err)
 			}
+		}
+	}
+
+	// A paused session takes priority over everything else: selection
+	// and convergence pruning must not make decisions against a worktree
+	// holding unresolved conflict markers. Dump mode remains read-only
+	// analysis and is exempt.
+	if !*dump {
+		if inProgress, err := dst.InProgressAM(); err != nil {
+			log.Fatal(err)
+		} else if inProgress {
+			log.Printf("conflict resolution is still pending in %s", dst.RepoRoot())
+			log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
+			log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
+			log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
+			log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
+			log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
+			log.Fatalf("session for this source/destination configuration is paused")
 		}
 	}
 
@@ -342,7 +360,8 @@ commitsLoop:
 	// of a failed run, which are not ancestors of its last applied
 	// commit. Legacy ids shorter than a full digest match by prefix,
 	// with the same collision window the anchor walk has always
-	// accepted; new tags record the full digest.
+	// accepted; new tags record the full digest. Ids shorter than seven
+	// characters are ignored outright, mirroring strip-commit's minimum.
 	processed, err := processedSourceIDs(dst)
 	if err != nil {
 		log.Fatalf("processed source ids: %v", err)
@@ -421,6 +440,11 @@ commitsLoop:
 			nskipped++
 			continue
 		}
+		// Counts attempts: am --3way may legitimately conclude "No
+		// changes -- Patch already applied" for a missed exclusion,
+		// creating no commit. Such misses self-heal on subsequent runs
+		// (the exclusion set grows from the tags that do land), so the
+		// imprecision is benign.
 		ncommit++
 		patch.Diffs = kept
 		if stripMessage {
@@ -476,7 +500,9 @@ commitsLoop:
 	}
 	// Push when this run applied anything, or when the repository still
 	// holds commits from a manually continued session that have not been
-	// pushed yet.
+	// pushed yet. Open only ever preserves such state when HEAD carries
+	// a grit shipit id, so an unpushed HEAD here is grit-authored by
+	// construction; the re-check keeps that invariant local and loud.
 	if ncommit == 0 {
 		head, err := dst.Head()
 		if err != nil {
@@ -486,6 +512,13 @@ commitsLoop:
 			log.Print("nothing to do")
 			return
 		}
+		authored, err := dst.HeadIsGritAuthored()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !authored {
+			log.Fatalf("%s holds unpushed commits without a grit shipit id at HEAD; refusing to publish them as synchronization work", dst.RepoRoot())
+		}
 		log.Print("pushing previously resolved session")
 	}
 	log.Printf("pushing changes to %s %s", dstURL, dstBranch)
@@ -494,15 +527,10 @@ commitsLoop:
 	}
 }
 
-// processedSourceIDRe matches a shipit source id that stands alone on
-// its own line, the form grit writes and the anchor walk greps for.
-// Matching ids anywhere in a message body would let prose that quotes an
-// id silently exclude real source commits. Note Go regexp (RE2) syntax:
-// (?:fb)? is optional, not the BRE \? escape used by git's --grep.
-var processedSourceIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a-z0-9]+)$`)
-
 // processedSourceIDs returns the set of shipit source ids recorded in
-// the destination repository's history.
+// the destination repository's history. Only ids of at least seven
+// characters are trusted, mirroring strip-commit's minimum: shorter ids
+// would exclude disproportionately large slices of the digest space.
 func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
 	commits, err := dst.Log()
 	if err != nil {
@@ -510,8 +538,10 @@ func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
 	}
 	processed := make(map[string]bool)
 	for _, c := range commits {
-		for _, match := range processedSourceIDRe.FindAllStringSubmatch(c.Body, -1) {
-			processed[match[1]] = true
+		for _, id := range c.OwnLineShipitIDs() {
+			if len(id) >= 7 {
+				processed[id] = true
+			}
 		}
 	}
 	return processed, nil
@@ -519,7 +549,10 @@ func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
 
 // isProcessed reports whether the provided full source digest is
 // accounted for by a recorded shipit source id, either exactly or (for
-// legacy, abbreviated ids) by prefix.
+// legacy, abbreviated ids) by prefix. Residual ambiguity: a destination
+// message that quotes an id on its own line — including one whose
+// four-space indentation Log dedents away — is indistinguishable from a
+// real tag, the same exposure the anchor walk has always had.
 func isProcessed(hex string, processed map[string]bool) bool {
 	if processed[hex] {
 		return true
