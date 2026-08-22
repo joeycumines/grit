@@ -1282,3 +1282,35 @@ func TestV2CaseMismatchedPrefixComponentAborts(t *testing.T) {
 		t.Fatalf("multi-component case mismatch did not abort:\n%s", out)
 	}
 }
+
+// TestV2NonASCIIPrefixComponentCasing pins CheckPrefixCasing against
+// core.quotePath escaping: a correctly spelled non-ASCII prefix
+// component must be recognized (sync proceeds), and its case-typo must
+// abort loudly.
+func TestV2NonASCIIPrefixComponentCasing(t *testing.T) {
+	for _, tc := range []struct {
+		prefix    string
+		wantAbort bool
+	}{
+		{"caf\u00e9/", false},
+		{"CAF\u00c9/", true},
+	} {
+		src, dst := setupGritRepos(t)
+
+		srcSpec := src.bare + "," + tc.prefix + "," + testBranch
+		dstSpec := dst.bare + ",," + testBranch
+
+		src.write("caf\u00e9/f.txt", "v1\n")
+		src.commit("first commit")
+		src.push()
+
+		out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+		aborted := strings.Contains(out, "only by letter case")
+		if tc.wantAbort && !aborted {
+			t.Fatalf("prefix %q: case mismatch did not abort:\n%s", tc.prefix, out)
+		}
+		if !tc.wantAbort && aborted {
+			t.Fatalf("prefix %q: correct spelling was rejected:\n%s", tc.prefix, out)
+		}
+	}
+}

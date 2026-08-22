@@ -147,7 +147,10 @@ func (r *Repo) CheckPrefixCasing(prefix string) error {
 	}
 	cur := ""
 	for _, part := range strings.Split(p, "/") {
-		args := []string{"ls-tree", "--name-only", "HEAD"}
+		// -z yields NUL-separated entries without core.quotePath
+		// escaping, so non-ASCII and control-character components
+		// compare byte-for-byte.
+		args := []string{"-c", "core.quotePath=false", "ls-tree", "-z", "--name-only", "HEAD"}
 		if cur != "" {
 			args = append(args, "--", ":(literal)"+cur)
 		}
@@ -159,14 +162,11 @@ func (r *Repo) CheckPrefixCasing(prefix string) error {
 		}
 		var foldMatch string
 		found := false
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if line == "" {
+		for _, entry := range strings.Split(string(out), "\x00") {
+			if entry == "" {
 				continue
 			}
-			name := line
-			if i := strings.LastIndex(name, "/"); i >= 0 {
-				name = name[i+1:]
-			}
+			name := filepath.Base(entry)
 			if name == part {
 				found = true
 				break
