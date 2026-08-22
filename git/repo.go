@@ -58,14 +58,31 @@ type Repo struct {
 	lock       *flock.T
 	config     map[string]string
 	originHead string
+	preserve   bool
 }
 
 // Open returns a repo representing the provided git remote url, branch, and
 // prefix within the repository. The prefix is interpreted to provide
 // a "view" into the git repository: all operations apply only to
-// this prefix. Repositories are safe for concurrent operations
-// across multiple uses on the same machine.
+// this prefix. The clone is a read-through cache of the remote: nothing
+// is ever pushed from it, so its local state is always discarded in
+// favor of the remote tip. Use OpenDestination for repositories whose
+// local commits grit itself creates and must preserve across runs.
+// Repositories are safe for concurrent operations across multiple uses
+// on the same machine.
 func Open(url, prefix, branch string) (*Repo, error) {
+	return open(url, prefix, branch, false)
+}
+
+// OpenDestination behaves like Open but marks the clone as a
+// synchronization destination: unpushed commits that grit authored (a
+// paused or manually continued am session) survive across runs, while
+// foreign unpushed state aborts loudly.
+func OpenDestination(url, prefix, branch string) (*Repo, error) {
+	return open(url, prefix, branch, true)
+}
+
+func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 	base := filepath.Base(url)
 	base = strings.TrimSuffix(base, filepath.Ext(base))
 	// Key the cache by everything that changes the clone's semantics:
@@ -83,16 +100,18 @@ func Open(url, prefix, branch string) (*Repo, error) {
 	// 128 bits of digest make cross-configuration collisions negligible
 	// while keeping directory names reasonably short.
 	path := filepath.Join(Dir, fmt.Sprintf("%s%x", base, b[:16]))
-	_, err := os.Stat(path)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	r := &Repo{url: url, root: path, prefix: prefix, branch: branch}
+	r := &Repo{url: url, root: path, prefix: prefix, branch: branch, preserve: preserve}
 	r.lock = flock.New(path + ".lock")
 	if err := r.lock.Lock(context.Background()); err != nil {
 		return nil, fmt.Errorf("lock %s: %v", path, err)
 	}
-	fresh := err != nil
+	// Stat under the lock: another process may have created the clone
+	// while this one waited for it.
+	_, statErr := os.Stat(path)
+	fresh := statErr != nil
+	if !os.IsNotExist(statErr) && statErr != nil {
+		return nil, statErr
+	}
 	if fresh {
 		os.MkdirAll(path, 0777)
 		if _, err := r.git(nil, "clone", "--single-branch", r.url, r.root); err != nil {
@@ -130,11 +149,13 @@ func Open(url, prefix, branch string) (*Repo, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Preservation decisions apply only to state that survived from a
-	// previous run. A freshly created clone simply starts wherever the
-	// remote's default branch points, which may legitimately be
-	// unrelated to the configured branch.
-	if fresh {
+	// Preservation decisions apply only to destination clones, and only
+	// to state that survived from a previous run. Source clones are
+	// read-through caches whose local state (e.g. left by -linearize)
+	// is always discarded, and a freshly created destination clone
+	// simply starts wherever the remote's default branch points, which
+	// may legitimately be unrelated to the configured branch.
+	if !r.preserve || fresh {
 		_, _ = r.git(nil, "am", "--abort")
 		if _, err := r.git(nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
 			return nil, err
@@ -217,7 +238,7 @@ func (c *Commit) OwnLineShipitIDs() []string {
 // HeadIsGritAuthored reports whether HEAD carries a shipit source id,
 // marking it as state grit itself created.
 func (r *Repo) HeadIsGritAuthored() (bool, error) {
-	commits, err := r.Log("-1", "HEAD")
+	commits, err := r.LogIgnoringPrefix("-1", "HEAD")
 	if err != nil {
 		return false, err
 	}

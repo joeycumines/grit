@@ -198,8 +198,8 @@ func main() {
 
 	log.Printf("synchronizing repo:%s prefix:%s branch:%s -> repo:%s prefix:%s branch:%s",
 		srcURL, srcPrefix, srcBranch, dstURL, dstPrefix, dstBranch)
-	open := func(url, prefix, branch string) *git.Repo {
-		r, err := git.Open(url, prefix, branch)
+	open := func(openFn func(url, prefix, branch string) (*git.Repo, error), url, prefix, branch string) *git.Repo {
+		r, err := openFn(url, prefix, branch)
 		if err != nil {
 			log.Fatalf("open %s: %v", url, err)
 		}
@@ -219,11 +219,11 @@ func main() {
 	// multiple repositories.
 	var src, dst *git.Repo
 	if srcURL < dstURL {
-		src = open(srcURL, srcPrefix, srcBranch)
-		dst = open(dstURL, dstPrefix, dstBranch)
+		src = open(git.Open, srcURL, srcPrefix, srcBranch)
+		dst = open(git.OpenDestination, dstURL, dstPrefix, dstBranch)
 	} else {
-		dst = open(dstURL, dstPrefix, dstBranch)
-		src = open(srcURL, srcPrefix, srcBranch)
+		dst = open(git.OpenDestination, dstURL, dstPrefix, dstBranch)
+		src = open(git.Open, srcURL, srcPrefix, srcBranch)
 	}
 	defer src.Close()
 	defer dst.Close()
@@ -310,7 +310,14 @@ func main() {
 		}
 	} else {
 		log.Printf("synchronizing: last diff: %v, source: %v", lastCommit.Digest, lastCommit.ShipitID())
-		ids := lastCommit.ShipitID()
+		// Prefer ids recorded on their own line: the walk greps for
+		// exactly that form, and prose quotations elsewhere in the
+		// message must not choose the resume base.
+		ids := lastCommit.OwnLineShipitIDs()
+		if len(ids) == 0 {
+			log.Printf("anchor %s matched the grep but carries no own-line id; falling back to body-wide scan", lastCommit)
+			ids = lastCommit.ShipitID()
+		}
 		if len(ids) == 0 {
 			log.Fatalf("no fbshipit-source-id found in commit: %+v", lastCommit)
 		}
@@ -695,6 +702,8 @@ func (r rules) isMessagePathStripped(path string) (bool, *regexp.Regexp) {
 	return false, nil
 }
 
+var binaryPatchMarker = []byte("GIT binary patch")
+
 // rewriteDiff applies the rulesets rewrite rules to the provided diff.
 // Diffs carrying git binary sections are never rewritten. Note that git
 // serializes NUL-free binary files as ordinary textual diffs; such
@@ -702,7 +711,14 @@ func (r rules) isMessagePathStripped(path string) (bool, *regexp.Regexp) {
 // rules should be anchored narrowly enough that they cannot match their
 // bytes.
 func (r rules) rewriteDiff(diff *git.Diff) {
-	if bytes.Contains(diff.Body, []byte("GIT binary patch")) {
+	// The parser places binary payloads (including their "GIT binary
+	// patch" marker) in Meta and leaves Body empty; textual diffs carry
+	// the payload in Body. Neither may be rewritten, and rewriting an
+	// empty body must not manufacture content.
+	if bytes.Contains(diff.Meta, binaryPatchMarker) || bytes.Contains(diff.Body, binaryPatchMarker) {
+		return
+	}
+	if len(diff.Body) == 0 {
 		return
 	}
 	for _, r := range r.rewrite {

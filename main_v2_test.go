@@ -321,8 +321,7 @@ func TestV2TagSetExclusionExactlyOnce(t *testing.T) {
 // destination commit carrying a legacy abbreviated (7-hex) shipit id
 // resolves as the resume anchor, bounding the selection range so its
 // source commit is not replayed. Prefix-matching of abbreviated ids
-// during tag-set exclusion is covered by TestIsProcessed. Prefix matching for legacy ids that exclude
-// non-ancestor commits is covered by TestIsProcessed.
+// during tag-set exclusion is covered by TestIsProcessed.
 func TestV2LegacyAbbreviatedAnchorSuppressesReplay(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
