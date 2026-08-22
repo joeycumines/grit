@@ -85,10 +85,6 @@ func OpenDestination(url, prefix, branch string) (*Repo, error) {
 func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 	base := filepath.Base(url)
 	base = strings.TrimSuffix(base, filepath.Ext(base))
-	// Key the cache by everything that changes the clone's semantics:
-	// two configurations sharing a URL but differing in branch or prefix
-	// must not share a working clone, or preservation logic could carry
-	// one configuration's unpushed state into the other's push.
 	h := sha256.New()
 	h.Write([]byte(url))
 	h.Write([]byte{0})
@@ -97,40 +93,53 @@ func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 	h.Write([]byte(branch))
 	b := h.Sum(nil)
 	os.MkdirAll(Dir, 0700)
-	// 128 bits of digest make cross-configuration collisions negligible
-	// while keeping directory names reasonably short.
 	path := filepath.Join(Dir, fmt.Sprintf("%s%x", base, b[:16]))
+	r := &Repo{url: url, root: path, prefix: prefix, branch: branch, preserve: preserve}
+	lock := flock.New(path + ".lock")
+	if err := lock.Lock(context.Background()); err != nil {
+		return nil, fmt.Errorf("lock %s: %v", path, err)
+	}
+	repo, err := r.openLocked()
+	if err != nil {
+		// Open failures release the lock; only success hands its
+		// lifetime to the caller (until Close).
+		lock.Unlock()
+		return nil, err
+	}
+	r.lock = lock
+	return repo, nil
+}
+
+// openLocked performs the open while the repository's lock is held.
+func (r *Repo) openLocked() (*Repo, error) {
 	// Announce caches abandoned by the key derivation change (they were
 	// keyed by URL alone): paused sessions or resolved-but-unpushed work
 	// left there by older versions require manual attention before they
 	// are lost to cleanup.
-	legacySum := sha256.Sum256([]byte(url))
-	legacy := filepath.Join(Dir, fmt.Sprintf("%s%02x%02x%02x%02x", base,
+	legacySum := sha256.Sum256([]byte(r.url))
+	legacyBase := filepath.Base(strings.TrimSuffix(r.url, filepath.Ext(r.url)))
+	legacy := filepath.Join(Dir, fmt.Sprintf("%s%02x%02x%02x%02x", legacyBase,
 		legacySum[0], legacySum[1], legacySum[2], legacySum[3]))
-	if legacy != path {
+	if legacy != r.root {
 		if _, err := os.Stat(legacy); err == nil {
 			log.Printf("note: legacy clone cache %s is no longer used; inspect it for paused sessions before deleting", legacy)
 		}
 	}
-	r := &Repo{url: url, root: path, prefix: prefix, branch: branch, preserve: preserve}
-	r.lock = flock.New(path + ".lock")
-	if err := r.lock.Lock(context.Background()); err != nil {
-		return nil, fmt.Errorf("lock %s: %v", path, err)
-	}
+
 	// Stat under the lock: another process may have created the clone
 	// while this one waited for it.
-	_, statErr := os.Stat(path)
+	_, statErr := os.Stat(r.root)
 	fresh := statErr != nil
 	if !os.IsNotExist(statErr) && statErr != nil {
 		return nil, statErr
 	}
 	if fresh {
-		os.MkdirAll(path, 0777)
+		os.MkdirAll(r.root, 0777)
 		if _, err := r.git(nil, "clone", "--single-branch", r.url, r.root); err != nil {
 			return nil, err
 		}
 	}
-	if _, err := r.git(nil, "fetch", "origin", branch); err != nil {
+	if _, err := r.git(nil, "fetch", "origin", r.branch); err != nil {
 		return nil, err
 	}
 	// Capture the remote tip now: any later fetch (e.g. object seeding)
@@ -271,12 +280,12 @@ func (r *Repo) RevParse(rev string) (string, error) {
 // 120000 (what git stores), including broken links, so deletions of
 // broken symlinks are never mistaken for converged deletions. Path
 // resolution is case-sensitive even on case-insensitive filesystems: a
-// path is treated as present only when a directory entry matches its
-// base name exactly, so that case-only renames (delete+add pairs) can
-// never be pruned as converged.
+// path is treated as present only when EVERY component matches a
+// directory entry exactly, so that case-only renames of files or
+// directories (delete+add pairs) can never be pruned as converged.
 func (r *Repo) BlobHash(path string) (digest, mode string, err error) {
 	full := filepath.Join(r.root, filepath.FromSlash(path))
-	if present, err := exactNamePresent(filepath.Dir(full), filepath.Base(full)); err != nil {
+	if present, err := caseExactPathPresent(r.root, path); err != nil {
 		return "", "", err
 	} else if !present {
 		return zeroBlob, "", nil
@@ -307,24 +316,34 @@ func (r *Repo) BlobHash(path string) (digest, mode string, err error) {
 	return strings.TrimSpace(string(out)), mode, nil
 }
 
-// exactNamePresent reports whether the directory contains an entry whose
-// name matches want exactly, byte-for-byte. Case-insensitive filesystems
-// resolve mismatched-case paths to existing entries; this check restores
-// the case sensitivity git's object model requires.
-func exactNamePresent(dir, want string) (bool, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
+// caseExactPathPresent reports whether every slash-separated component
+// of rel matches a directory entry exactly, byte-for-byte, starting at
+// root. Case-insensitive filesystems resolve mismatched-case paths to
+// existing entries at every component; this check restores the case
+// sensitivity git's object model requires.
+func caseExactPathPresent(root, rel string) (bool, error) {
+	cur := root
+	for _, part := range strings.Split(rel, "/") {
+		entries, err := os.ReadDir(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		found := false
+		for _, entry := range entries {
+			if entry.Name() == part {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false, nil
 		}
-		return false, err
+		cur = filepath.Join(cur, part)
 	}
-	for _, entry := range entries {
-		if entry.Name() == want {
-			return true, nil
-		}
-	}
-	return false, nil
+	return true, nil
 }
 
 // FetchObjects fetches the provided branch from the local repository at
@@ -513,6 +532,10 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 			}
 			diff.Meta = bytes.TrimSuffix(diff.Meta, []byte{'\n'})
 			diffs = append(diffs, diff)
+		} else if len(diff.Path) > len(r.prefix) && strings.EqualFold(diff.Path[:len(r.prefix)], r.prefix) {
+			// A case-insensitive host or a mistyped configuration would
+			// otherwise silently drop every diff of a renamed prefix.
+			log.Fatalf("diff path %s matches prefix %q only by letter case; fix the configured prefix", diff.Path, r.prefix)
 		} else {
 			log.Debug.Printf("dropping diff with path %s not in prefix %s", diff.Path, r.prefix)
 		}

@@ -446,8 +446,10 @@ func TestV2UnbornSourceFailsLoudly(t *testing.T) {
 	if err == nil {
 		t.Fatalf("unborn source unexpectedly succeeded:\n%s", out)
 	}
-	if !strings.Contains(string(out), "couldn't find remote ref") {
-		t.Fatalf("expected a loud missing-branch failure:\n%s", out)
+	// Assert the failure loudly names the source repository without
+	// coupling to git's exact stderr wording across versions.
+	if !strings.Contains(string(out), "src.git") {
+		t.Fatalf("expected a loud failure referencing the source:\n%s", out)
 	}
 }
 
@@ -817,5 +819,40 @@ func TestV2CaseOnlyRenameIsNotPruned(t *testing.T) {
 	tracked := dst.gitOut("ls-files")
 	if !strings.Contains(tracked, "README") || strings.Contains(tracked, "readme") {
 		t.Fatalf("case-only rename did not land at destination; tracked files:\n%s", tracked)
+	}
+}
+
+// TestV2CaseOnlySubdirRenameIsNotPruned pins case sensitivity for
+// intermediate path components: a case-only SUBDIRECTORY rename arrives
+// as delete+add, and on a case-insensitive host the add half resolves
+// through the still-existing old-case directory. Pruning it would
+// silently drop the file; it must be applied instead.
+func TestV2CaseOnlySubdirRenameIsNotPruned(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/sub/f.txt", "contents\n")
+	src.write("proj/b.txt", "b\n")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	runGit(t, src.dir, "rm", "proj/sub/f.txt")
+	src.write("proj/SUB/f.txt", "renamed contents\n")
+	src.commit("case-only subdir rename")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "skipping converged") {
+		t.Fatalf("subdir case-only rename's add half was falsely pruned:\n%s", out)
+	}
+	dst.pull()
+
+	tracked := dst.gitOut("ls-files")
+	if !strings.Contains(tracked, "SUB/f.txt") || strings.Contains(tracked, "sub/f.txt") {
+		t.Fatalf("subdir case-only rename did not land; tracked files:\n%s", tracked)
 	}
 }
