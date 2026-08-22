@@ -234,6 +234,25 @@ func main() {
 		}
 	}
 
+	// A paused session takes priority over everything else: selection
+	// and convergence pruning must not make decisions while resolution
+	// is outstanding. Dump mode applies nothing, pushes nothing, and
+	// previews the unpruned candidate set, so it may proceed for
+	// read-only inspection even mid-pause.
+	if !*dump {
+		if inProgress, err := dst.InProgressAM(); err != nil {
+			log.Fatal(err)
+		} else if inProgress {
+			log.Printf("conflict resolution is still pending in %s", dst.RepoRoot())
+			log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
+			log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
+			log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
+			log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
+			log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
+			log.Fatalf("session for this source/destination configuration is paused")
+		}
+	}
+
 	// Make the source repository's objects available in the destination
 	// clone, so that three-way merges have the pre-image blobs recorded
 	// by patches at their disposal. Open guarantees a resolvable source
@@ -253,25 +272,6 @@ func main() {
 	}
 	if err := dst.CheckPrefixCasing(dstPrefix); err != nil {
 		log.Fatalf("%s: %v", dst, err)
-	}
-
-	// A paused session takes priority over everything else: selection
-	// and convergence pruning must not make decisions against a worktree
-	// holding unresolved conflict markers. Dump mode applies nothing and
-	// no longer consults destination state, so it may proceed for
-	// read-only inspection of the candidate set.
-	if !*dump {
-		if inProgress, err := dst.InProgressAM(); err != nil {
-			log.Fatal(err)
-		} else if inProgress {
-			log.Printf("conflict resolution is still pending in %s", dst.RepoRoot())
-			log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
-			log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
-			log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
-			log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
-			log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
-			log.Fatalf("session for this source/destination configuration is paused")
-		}
 	}
 
 	// Last synchronized commit that applies, if any. We apply the
@@ -462,9 +462,6 @@ commitsLoop:
 		// the source side only, since it cannot know the destination
 		// state that a real run will have built up when it reaches each
 		// patch.
-		// Convergence requires both content and (when the diff declares
-		// one) mode to match: identical bytes with a pending exec-bit
-		// flip are not present at the destination and must apply.
 		var kept []git.Diff
 		if *dump {
 			kept = diffs
@@ -482,7 +479,7 @@ commitsLoop:
 				}
 				newBlob, ok := diff.NewBlob()
 				if ok {
-					curBlob, curMode, err := dst.BlobHash(diff.Path)
+					curBlob, curMode, err := dst.HeadEntry(diff.Path)
 					if err == nil && curBlob == newBlob {
 						if newMode, ok := diff.NewMode(); !ok || newMode == curMode {
 							log.Printf("skipping converged %s in %s", diff.Path, c)

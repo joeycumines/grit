@@ -366,81 +366,28 @@ func (r *Repo) RevParse(rev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// BlobHash returns the git blob digest and git file mode of the file at
-// the provided repository-relative working tree path. Deleted files
-// hash to the zero digest with an empty mode, mirroring the index line
-// of git diffs. Symbolic links are hashed by their link text with mode
-// 120000 (what git stores), including broken links, so deletions of
-// broken symlinks are never mistaken for converged deletions. Path
-// resolution is case-sensitive even on case-insensitive filesystems: a
-// path is treated as present only when EVERY component matches a
-// directory entry exactly, so that case-only renames of files or
-// directories (delete+add pairs) can never be pruned as converged.
-func (r *Repo) BlobHash(path string) (digest, mode string, err error) {
-	full := filepath.Join(r.root, filepath.FromSlash(path))
-	if present, err := caseExactPathPresent(r.root, path); err != nil {
-		return "", "", err
-	} else if !present {
-		return zeroBlob, "", nil
-	}
-	fi, lerr := os.Lstat(full)
-	if lerr != nil {
-		return "", "", lerr
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(full)
-		if err != nil {
-			return "", "", err
-		}
-		out, err := r.git([]byte(target), "hash-object", "--stdin")
-		if err != nil {
-			return "", "", err
-		}
-		return strings.TrimSpace(string(out)), "120000", nil
-	}
-	out, err := r.git(nil, "hash-object", "--", path)
+// HeadEntry returns the git blob digest and file mode that HEAD's tree
+// records for the provided repository-relative path. Paths absent from
+// the tree return the zero digest with an empty mode, mirroring the
+// index line of git diffs. Tree reads are inherently case-sensitive and
+// reflect committed state only, so convergence decisions are immune to
+// worktree leftovers (untracked files, conflict markers) and to the
+// filesystem's case sensitivity; an incoming addition colliding with an
+// untracked leftover instead fails loudly at application time.
+func (r *Repo) HeadEntry(path string) (digest, mode string, err error) {
+	out, err := r.git(nil, "ls-tree", "HEAD", "--", path)
 	if err != nil {
 		return "", "", err
 	}
-	// The filesystem exec bit stands in for the tree's mode here. On
-	// hosts where git ignores filemode the two can disagree; such skew
-	// only ever keeps diffs for application (loud) instead of pruning
-	// them (silent).
-	mode = "100644"
-	if fi.Mode().Perm()&0100 != 0 {
-		mode = "100755"
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return zeroBlob, "", nil
 	}
-	return strings.TrimSpace(string(out)), mode, nil
-}
-
-// caseExactPathPresent reports whether every slash-separated component
-// of rel matches a directory entry exactly, byte-for-byte, starting at
-// root. Case-insensitive filesystems resolve mismatched-case paths to
-// existing entries at every component; this check restores the case
-// sensitivity git's object model requires.
-func caseExactPathPresent(root, rel string) (bool, error) {
-	cur := root
-	for _, part := range strings.Split(rel, "/") {
-		entries, err := os.ReadDir(cur)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		found := false
-		for _, entry := range entries {
-			if entry.Name() == part {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false, nil
-		}
-		cur = filepath.Join(cur, part)
+	fields := strings.Fields(strings.SplitN(line, "\t", 2)[0])
+	if len(fields) < 3 {
+		return "", "", fmt.Errorf("malformed ls-tree output for %s: %q", path, line)
 	}
-	return true, nil
+	return fields[2], fields[0], nil
 }
 
 // FetchObjects fetches the provided branch from the local repository at

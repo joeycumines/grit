@@ -921,3 +921,68 @@ func TestV2CaseMismatchedPrefixAborts(t *testing.T) {
 		t.Fatalf("case-mismatched prefix did not abort loudly:\n%s", out)
 	}
 }
+
+// TestV2UntrackedLeftoverDoesNotSilenceAddition pins that convergence
+// pruning consults HEAD's committed tree, never the worktree: an
+// untracked leftover identical to an incoming addition cannot silence
+// it. The collision fails loudly at application time; after cleaning
+// the leftover, the same run converges.
+func TestV2UntrackedLeftoverDoesNotSilenceAddition(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Untracked leftover inside grit's own destination clone — exactly
+	// where grit's pause guidance tells users to edit.
+	payload := "payload\n"
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
+	if err := os.MkdirAll(filepath.Join(clone, "data"), 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clone, "data", "blob.txt"), []byte(payload), 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	// The source adds the identical file through a real commit.
+	src.write("proj/data/blob.txt", payload)
+	src.commit("add data blob")
+	src.push()
+
+	// The collision must fail loudly at application time: pruning may
+	// not consult the untracked leftover.
+	gritRun := func() (string, error) {
+		cmd := exec.Command(src.gritBin,
+			"-config=user.name=test,user.email="+testAuthorEnv,
+			"-push", srcSpec, dstSpec)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	out, runErr := gritRun()
+	if strings.Contains(out, "skipping converged") {
+		t.Fatalf("untracked leftover silenced an incoming addition:\n%s", out)
+	}
+	if runErr == nil {
+		t.Fatalf("untracked collision should fail loudly at apply time:\n%s", out)
+	}
+
+	// Discard the failed application's session and the leftover, then
+	// converge: the addition must land.
+	runGit(t, clone, "am", "--abort")
+	runGit(t, clone, "clean", "-fd")
+	out, runErr = gritRun()
+	if runErr != nil {
+		t.Fatalf("post-cleanup run failed:\n%s", out)
+	}
+	if !strings.Contains(out, "applying") {
+		t.Fatalf("addition did not apply after cleanup:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+}
