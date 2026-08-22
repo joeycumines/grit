@@ -244,8 +244,9 @@ func (r *Repo) openLocked() (*Repo, error) {
 	// Destination clones preserve work that must survive across grit
 	// invocations: a paused git am session awaiting conflict resolution,
 	// and commits that a continued session has already created but that
-	// have not been pushed yet. Both are only ever written by grit
-	// itself, and discarding them would destroy manually resolved work.
+	// have not been pushed yet. Every such commit is authored by grit —
+	// carrying a shipit id or a convergence-pruned marker, verified per
+	// commit — and discarding it would destroy manually resolved work.
 	// HEAD that is merely behind the remote tip is the normal case and
 	// gets reset. Source clones are read-through caches: their local
 	// state — including anything left behind by -linearize or a stray
@@ -356,17 +357,31 @@ func (c *Commit) OwnLineGritTagIDs() []string {
 	return ids
 }
 
+var ownLineConvergenceMarkerRe = regexp.MustCompile(`(?m)^grit-convergence-pruned: ([0-9]+)/([0-9]+)$`)
+
+// OwnLineConvergenceMarkers reports the convergence-pruned markers grit
+// writes on commits whose converged diffs were deliberately left
+// untagged — the second serialization the authorship gates accept.
+func (c *Commit) OwnLineConvergenceMarkers() []string {
+	var markers []string
+	for _, match := range ownLineConvergenceMarkerRe.FindAllStringSubmatch(c.Body, -1) {
+		markers = append(markers, match[0])
+	}
+	return markers
+}
+
 // UnpushedCommitsAreGritAuthored reports whether every commit between
-// base and HEAD carries a shipit source id, marking the unpushed range
-// as state grit itself created. A single foreign commit buried under an
-// otherwise authored HEAD fails the check.
+// base and HEAD is state grit itself created: carrying either a shipit
+// source id or a convergence-pruned marker (the serialization used for
+// commits whose converged diffs are deliberately left untagged). A
+// single foreign commit anywhere in the range fails the check.
 func (r *Repo) UnpushedCommitsAreGritAuthored(base string) (bool, error) {
 	commits, err := r.LogIgnoringPrefix(base + "..HEAD")
 	if err != nil {
 		return false, err
 	}
 	for _, c := range commits {
-		if len(c.OwnLineGritTagIDs()) == 0 {
+		if len(c.OwnLineGritTagIDs()) == 0 && len(c.OwnLineConvergenceMarkers()) == 0 {
 			return false, nil
 		}
 	}

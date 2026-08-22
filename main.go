@@ -506,8 +506,15 @@ commitsLoop:
 				patch.Body += "\n\n"
 			}
 			patch.Body += shipitTag
-		} else if !*dump {
-			log.Printf("%s: %d of %d diffs already converged; commit will remain re-examinable", c, pruned, len(diffs))
+		} else {
+			// Machine-checkable marker proving grit authored this
+			// untagged commit: the authorship gates accept either a
+			// shipit tag or this marker, and the count documents why
+			// the commit carries no tag.
+			patch.Body += fmt.Sprintf("\ngrit-convergence-pruned: %d/%d", pruned, len(diffs))
+			if !*dump {
+				log.Printf("%s: %d of %d diffs already converged; commit will remain re-examinable", c, pruned, len(diffs))
+			}
 		}
 		// Counts commits that actually moved the destination HEAD:
 		// am --3way may legitimately conclude "No changes -- Patch
@@ -581,9 +588,10 @@ commitsLoop:
 	}
 	// Push when this run applied anything, or when the repository still
 	// holds commits from a manually continued session that have not been
-	// pushed yet. Open only ever preserves such state when HEAD carries
-	// a grit shipit id, so an unpushed HEAD here is grit-authored by
-	// construction; the re-check keeps that invariant local and loud.
+	// pushed yet. Open only preserves unpushed state whose every commit
+	// is grit-authored — carrying a shipit id or a convergence-pruned
+	// marker — so an unpushed HEAD here is grit's own by construction;
+	// the re-check keeps that invariant local and loud.
 	if ncommit == 0 {
 		head, err := dst.Head()
 		if err != nil {
