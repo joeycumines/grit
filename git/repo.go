@@ -113,17 +113,8 @@ func OpenDestination(url, prefix, branch string) (*Repo, error) {
 }
 
 func open(url, prefix, branch string, preserve bool) (*Repo, error) {
-	base := filepath.Base(url)
-	base = strings.TrimSuffix(base, filepath.Ext(base))
-	h := sha256.New()
-	h.Write([]byte(url))
-	h.Write([]byte{0})
-	h.Write([]byte(prefix))
-	h.Write([]byte{0})
-	h.Write([]byte(branch))
-	b := h.Sum(nil)
 	os.MkdirAll(Dir, 0700)
-	path := filepath.Join(Dir, fmt.Sprintf("%s%x", base, b[:16]))
+	path := CachePath(url, prefix, branch)
 	r := &Repo{url: url, root: path, prefix: prefix, branch: branch, preserve: preserve}
 	lock := flock.New(path + ".lock")
 	if err := lock.Lock(context.Background()); err != nil {
@@ -140,49 +131,57 @@ func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 	return repo, nil
 }
 
-// CheckPrefixCasing verifies that the configured prefix matches a path
-// in HEAD's tree exactly. A prefix differing only by letter case would
-// silently select nothing on tree-level pathspec matching and drop every
-// diff on case-insensitive hosts; misconfiguration must abort loudly.
-// Absent prefixes are allowed: they can legitimately appear later in the
-// history during initial synchronization. Unborn repositories are
-// permitted and handled by their callers.
+// CheckPrefixCasing verifies that every component of the configured
+// prefix matches a path in HEAD's tree exactly. A component differing
+// only by letter case would silently select nothing on tree-level
+// pathspec matching and drop every diff on case-insensitive hosts;
+// misconfiguration must abort loudly. Components that do not exist at
+// all are allowed: they can legitimately appear later in the history
+// during initial synchronization. Unborn repositories are permitted and
+// handled by their callers.
 func (r *Repo) CheckPrefixCasing(prefix string) error {
 	p := strings.Trim(prefix, "/")
 	if p == "" {
 		return nil
 	}
-	parent, want := "", p
-	if i := strings.LastIndex(p, "/"); i >= 0 {
-		parent, want = p[:i], p[i+1:]
-	}
-	args := []string{"ls-tree", "--name-only", "HEAD"}
-	if parent != "" {
-		args = append(args, "--", parent)
-	}
-	out, err := r.git(nil, args...)
-	if err != nil {
-		// An unborn or otherwise unreadable HEAD is not a casing
-		// problem; leave it to the caller's normal flows.
-		return nil
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		name := line
-		if i := strings.LastIndex(name, "/"); i >= 0 {
-			name = name[i+1:]
+	cur := ""
+	for _, part := range strings.Split(p, "/") {
+		args := []string{"ls-tree", "--name-only", "HEAD"}
+		if cur != "" {
+			args = append(args, "--", cur)
 		}
-		if name == want {
+		out, err := r.git(nil, args...)
+		if err != nil {
+			// An unborn or otherwise unreadable HEAD is not a casing
+			// problem; leave it to the caller's normal flows.
 			return nil
 		}
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		name := line
-		if i := strings.LastIndex(name, "/"); i >= 0 {
-			name = name[i+1:]
+		var foldMatch string
+		found := false
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line == "" {
+				continue
+			}
+			name := line
+			if i := strings.LastIndex(name, "/"); i >= 0 {
+				name = name[i+1:]
+			}
+			if name == part {
+				found = true
+				break
+			}
+			if foldMatch == "" && strings.EqualFold(name, part) {
+				foldMatch = name
+			}
 		}
-		if strings.EqualFold(name, want) {
-			return fmt.Errorf("configured prefix %q does not exist at HEAD, but %q differs only by letter case; fix the prefix spelling", p, name)
+		if !found {
+			if foldMatch != "" {
+				have := p[:len(cur)]
+				return fmt.Errorf("configured prefix %q does not match the repository: at HEAD, %q differs from %q only by letter case; fix the prefix spelling", p, have+foldMatch, have+part)
+			}
+			return nil
 		}
+		cur = cur + part + "/"
 	}
 	return nil
 }
@@ -201,11 +200,24 @@ func (r *Repo) openLocked() (*Repo, error) {
 	}
 
 	// Stat under the lock: another process may have created the clone
-	// while this one waited for it.
-	_, statErr := os.Stat(r.root)
-	fresh := statErr != nil
-	if !os.IsNotExist(statErr) && statErr != nil {
-		return nil, statErr
+	// while this one waited for it. A leftover directory that never
+	// became a git repository (crash mid-clone) is removed so the entry
+	// cannot wedge forever.
+	fresh := false
+	if _, statErr := os.Stat(r.root); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return nil, statErr
+		}
+		fresh = true
+	} else if _, gitErr := os.Stat(filepath.Join(r.root, ".git")); gitErr != nil {
+		if !os.IsNotExist(gitErr) {
+			return nil, gitErr
+		}
+		if err := os.RemoveAll(r.root); err != nil {
+			return nil, err
+		}
+		fresh = true
+		log.Printf("removed incomplete clone cache %s left by an interrupted run", r.root)
 	}
 	if fresh {
 		os.MkdirAll(r.root, 0777)

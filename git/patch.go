@@ -116,16 +116,6 @@ func (p Patch) String() string {
 		p.ID.Hex()[:7], p.Author, p.Time, p.Subject, len(p.Diffs))
 }
 
-// Paths returns the paths touched by this Patch
-// as a set.
-func (p Patch) Paths() map[string]bool {
-	paths := make(map[string]bool)
-	for _, diff := range p.Diffs {
-		paths[diff.Path] = true
-	}
-	return paths
-}
-
 // Patch returns the serialized patch as a string.
 func (p Patch) Patch() string {
 	var b strings.Builder
@@ -274,16 +264,6 @@ func foreach(b []byte, prefix string, do func(section []byte) error) error {
 		}
 		b = b[i+1:]
 	}
-}
-
-var headerRe = regexp.MustCompile(`^([[:alnum:]]+): (.*)$`)
-
-func parseHeader(line []byte) (header, value []byte, ok bool) {
-	g := headerRe.FindSubmatch(line)
-	if g == nil {
-		return nil, nil, false
-	}
-	return g[1], g[2], true
 }
 
 var diffHeaderRe = regexp.MustCompile(`^diff --git a/([^ ]+)`)
