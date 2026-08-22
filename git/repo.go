@@ -41,6 +41,10 @@ func init() {
 	}
 }
 
+// ErrStaleCloneCache reports that a clone cache held state that could
+// not be preserved and was removed; Open recovers by recloning.
+var ErrStaleCloneCache = errors.New("stale clone cache discarded")
+
 // Dir is the directory in which git checkouts are made.
 var Dir = "/var/tmp/grit"
 
@@ -122,6 +126,16 @@ func open(url, prefix, branch string, preserve bool) (*Repo, error) {
 		return nil, fmt.Errorf("lock %s: %v", path, err)
 	}
 	repo, err := r.openLocked()
+	if errors.Is(err, ErrStaleCloneCache) {
+		// The stale directory was removed; rebuild the clone under the
+		// still-held lock and retry the open exactly once.
+		os.MkdirAll(r.root, 0777)
+		if _, cerr := r.git(nil, "clone", "--single-branch", "--branch", r.branch, r.url, r.root); cerr != nil {
+			lock.Unlock()
+			return nil, cerr
+		}
+		repo, err = r.openLocked()
+	}
 	if err != nil {
 		// Open failures release the lock; only success hands its
 		// lifetime to the caller (until Close).
@@ -272,15 +286,27 @@ func (r *Repo) openLocked() (*Repo, error) {
 			return nil, err
 		}
 		if !ahead {
-			authored, err := r.UnpushedCommitsAreGritAuthored(r.originHead)
+			authored, err := r.PreservedTailIsGritAuthored(r.originHead)
 			if err != nil {
 				return nil, err
 			}
-			if !authored {
-				return nil, fmt.Errorf("%s holds unpushed commits without a grit shipit id at HEAD; this is not grit-authored state -- inspect the repository and remove or explicitly adopt them before synchronizing", r.root)
+			if authored {
+				log.Printf("preserving %s: local commits from a resolved session have not been pushed yet", r.root)
+				return r, nil
 			}
-			log.Printf("preserving %s: local commits from a resolved session have not been pushed yet", r.root)
-			return r, nil
+			// Not connected to the remote tip and not entirely
+			// grit-authored: either a foreign history or a stale
+			// grit-only lineage stranded by an out-of-band rewrite.
+			// The former must never be published; the latter is fully
+			// re-derivable from the authoritative source. Both resolve
+			// by discarding the disposable cache and recloning, which
+			// cannot lose anything not already on the remote or in the
+			// source repository.
+			log.Printf("%s holds unpushed commits without grit authorship markers and does not descend from the remote tip; discarding stale clone cache and recloning", r.root)
+			if err := os.RemoveAll(r.root); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: %s", ErrStaleCloneCache, r.root)
 		}
 	}
 	_, _ = r.git(nil, "am", "--abort")
@@ -370,20 +396,36 @@ func (c *Commit) OwnLineConvergenceMarkers() []string {
 	return markers
 }
 
-// UnpushedCommitsAreGritAuthored reports whether every commit between
-// base and HEAD is state grit itself created: carrying either a shipit
-// source id or a convergence-pruned marker (the serialization used for
-// commits whose converged diffs are deliberately left untagged). A
-// single foreign commit anywhere in the range fails the check.
-func (r *Repo) UnpushedCommitsAreGritAuthored(base string) (bool, error) {
-	commits, err := r.LogIgnoringPrefix(base + "..HEAD")
+// PreservedTailIsGritAuthored reports whether every commit between the
+// provided origin tip and HEAD is state grit itself created: carrying
+// either a shipit source id or a convergence-pruned marker. When the
+// origin tip is not reachable from HEAD (an unrelated rebuilt history),
+// the outcome depends on the scan: a tail composed entirely of
+// grit-authored commits indicates stale-but-rederivable cache state;
+// any non-authored commit indicates foreign state.
+func (r *Repo) PreservedTailIsGritAuthored(originHead string) (bool, error) {
+	commits, err := r.LogIgnoringPrefix("HEAD")
 	if err != nil {
 		return false, err
 	}
+	// Authorship here uses grit's exact serialization (flush-left,
+	// fb-prefixed) or the convergence-pruned marker: Log's blanket
+	// four-space dedentation would otherwise resurrect indented prose
+	// quotations as authoritative ids.
+	sawOrigin := false
+	allAuthored := true
 	for _, c := range commits {
-		if len(c.OwnLineGritTagIDs()) == 0 && len(c.OwnLineConvergenceMarkers()) == 0 {
-			return false, nil
+		if c.Digest.Hex() == originHead {
+			sawOrigin = true
+			break
 		}
+		if len(c.OwnLineGritTagIDs()) == 0 && len(c.OwnLineConvergenceMarkers()) == 0 {
+			allAuthored = false
+			break
+		}
+	}
+	if !sawOrigin {
+		return allAuthored, nil
 	}
 	return true, nil
 }
@@ -466,6 +508,9 @@ func (r *Repo) String() string {
 // Close relinquishes the repo's lock. Repo operations may not
 // be safely performed after the repository has been closed.
 func (r *Repo) Close() error {
+	if r.lock == nil {
+		return nil
+	}
 	return r.lock.Unlock()
 }
 
@@ -672,6 +717,24 @@ func (r *Repo) Apply(patch Patch) error {
 	// instead of failing, while leaving genuine conflicts paused for
 	// resolution.
 	_, err := r.git(b.Bytes(), "am", "--3way", "--keep-non-patch", "--keep-cr")
+	return err
+}
+
+// CommitEmptyWithMessageFile creates an empty commit whose message is
+// read from the provided repository-relative file, preserving the
+// record of an applied patch that produced no changes.
+func (r *Repo) CommitEmptyWithMessageFile(relPath string) error {
+	_, err := r.git(nil, "commit", "--allow-empty", "-F", relPath)
+	return err
+}
+
+// ResetToRemote discards all local state in favor of the remote tip of
+// the configured branch. Used after a failed push: a non-fast-forward
+// rejection means the destination advanced independently, and any
+// locally applied commits were built on a stale base.
+func (r *Repo) ResetToRemote() error {
+	_, _ = r.git(nil, "am", "--abort")
+	_, err := r.git(nil, "reset", "--hard", "FETCH_HEAD")
 	return err
 }
 

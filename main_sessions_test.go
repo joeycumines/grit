@@ -176,8 +176,15 @@ func TestV2ForeignUnpushedStateAborts(t *testing.T) {
 		"commit", "--allow-empty", "-m", "stray local commit")
 
 	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
-	if !strings.Contains(out, "without a grit shipit id") {
-		t.Fatalf("foreign unpushed state did not abort loudly:\n%s", out)
+	if !strings.Contains(out, "discarding stale clone cache") {
+		t.Fatalf("foreign unpushed state did not trigger cache recovery:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("recovered run did not reach a fixed point:\n%s", out)
+	}
+	tracked := dst.gitOut("ls-files")
+	if strings.Contains(tracked, "stray") {
+		t.Fatalf("foreign content leaked into the destination:\n%s", tracked)
 	}
 }
 
@@ -253,7 +260,7 @@ func TestV2IndentedQuotationIsNotGritAuthored(t *testing.T) {
 		"commit", "-m", foreign)
 
 	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
-	if !strings.Contains(out, "without a grit shipit id") {
+	if !strings.Contains(out, "discarding stale clone cache") {
 		t.Fatalf("indented quotation passed the authorship gate:\n%s", out)
 	}
 }

@@ -300,6 +300,32 @@ func main() {
 		if len(last) == 0 {
 			break
 		}
+		// Anchors recording source revisions that no longer exist
+		// (rewritten or recreated source histories) cannot bound a
+		// resume range: stepping past them lets the run fall through to
+		// initial synchronization, where tag-set exclusion drops
+		// already-mirrored commits and convergence pruning absorbs
+		// equivalent content.
+		anchorIDs := last[0].OwnLineShipitIDs()
+		if len(anchorIDs) == 0 {
+			anchorIDs = last[0].ShipitID()
+		}
+		resolvable := false
+		for _, id := range anchorIDs {
+			if _, rerr := src.RevParse(id + "^{commit}"); rerr == nil {
+				resolvable = true
+				break
+			}
+		}
+		if len(anchorIDs) > 0 && !resolvable {
+			log.Printf("commit %s is not applicable to %s: skipping", last[0], dst)
+			log.Printf("anchor records unresolvable source id(s) %v; ignoring for resume", anchorIDs)
+			head = last[0].Digest.Hex() + "^"
+			if _, err := dst.RevParse(head); err != nil {
+				log.Fatalf("anchor walk reached tagged root commit %s with no parent; the oldest recorded shipit id cannot be matched against the source -- retag or rewrite destination history to repair", last[0])
+			}
+			continue
+		}
 		applies, err := rules.isCommitApplicable(last[0], dst)
 		if err != nil {
 			log.Fatalf("isCommitApplicable %s: %v", last[0], err)
@@ -340,13 +366,6 @@ func main() {
 			log.Fatalf("no fbshipit-source-id found in commit: %+v", lastCommit)
 		}
 		newestID := ids[len(ids)-1]
-		// Fail loudly when the anchor's source commit is no longer
-		// resolvable (rewritten or garbage-collected source history):
-		// depending on the git version, an unresolvable revision could
-		// otherwise degrade into an empty selection and a silent stall.
-		if _, err := src.RevParse(newestID + "^{commit}"); err != nil {
-			log.Fatalf("resume anchor %s does not resolve in %s: %v", newestID, src, err)
-		}
 		var err error
 		// Copy every source commit in newestID..srcBranch, not only those
 		// that descend from newestID: work merged into srcBranch from side
@@ -601,7 +620,7 @@ commitsLoop:
 			log.Print("nothing to do")
 			return
 		}
-		authored, err := dst.UnpushedCommitsAreGritAuthored(dst.OriginHead())
+		authored, err := dst.PreservedTailIsGritAuthored(dst.OriginHead())
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -612,6 +631,16 @@ commitsLoop:
 	}
 	log.Printf("pushing changes to %s %s", dstURL, dstBranch)
 	if err := dst.Push("origin", dstBranch); err != nil {
+		// A rejected push means the destination advanced
+		// independently of this run's base. Discard the diverged local
+		// state: the next run re-selects against the destination's
+		// actual tip, and convergence pruning re-derives whatever is
+		// still needed.
+		if rerr := dst.ResetToRemote(); rerr != nil {
+			log.Printf("reset after failed push also failed: %v", rerr)
+		} else {
+			log.Printf("discarded local state after failed push; re-run this command to recompute against the destination's current tip")
+		}
 		log.Fatalf("%s: push origin %s: %v", dst, dstBranch, err)
 	}
 }
