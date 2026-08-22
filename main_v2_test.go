@@ -1217,3 +1217,68 @@ func TestV2IndentedQuotationIsNotGritAuthored(t *testing.T) {
 		t.Fatalf("indented quotation passed the authorship gate:\n%s", out)
 	}
 }
+
+// TestV2StripMessagePartialStaysUntagged pins that strip-message rules
+// cannot re-tag a partially-pruned commit: the surviving half applies,
+// the commit lands untagged (re-examinable), and the stripped-subject
+// override is reserved for fully-tagged commits.
+func TestV2StripMessagePartialStaysUntagged(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// gen/a.txt arrives at the destination directly; the source commit
+	// modifies it and adds gen/b.txt. Every path matches the
+	// strip-message rule, and half the diffs converge.
+	dst.write("a.txt", "A2\n")
+	dst.commit("destination receives a.txt directly")
+	dst.push()
+	src.write("proj/a.txt", "A2\n")
+	src.write("proj/b.txt", "B\n")
+	src.commit("gen update")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec,
+		"strip-message:^gen/")
+	if !strings.Contains(out, "skipping converged") {
+		t.Fatalf("converged half was not pruned:\n%s", out)
+	}
+	if !strings.Contains(out, "remain re-examinable") {
+		t.Fatalf("partial commit was not kept re-examinable:\n%s", out)
+	}
+	dst.pull()
+
+	tip := strings.TrimSpace(dst.gitOut("log", "-1", "--format=%B"))
+	if strings.Contains(tip, "fbshipit-source-id:") || strings.Contains(tip, "Commit message stripped.") {
+		t.Fatalf("partially-pruned commit landed tagged or stripped: %q", tip)
+	}
+	if got := dstRead(t, dst.dir, "b.txt"); got != "B\n" {
+		t.Fatalf("surviving half did not land: %q", got)
+	}
+}
+
+// TestV2CaseMismatchedPrefixComponentAborts covers multi-component
+// prefixes: a wrong-cased intermediate component must abort loudly even
+// though tree-level pathspecs would silently select nothing.
+func TestV2CaseMismatchedPrefixComponentAborts(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",PROJ/sub/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/sub/f.txt", "v1")
+	src.commit("first commit")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "only by letter case") {
+		t.Fatalf("multi-component case mismatch did not abort:\n%s", out)
+	}
+}

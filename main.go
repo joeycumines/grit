@@ -421,7 +421,9 @@ commitsLoop:
 			patch.Body += "\n\n"
 		}
 		shipitTag := fmt.Sprintf("fbshipit-source-id: %s", patch.ID.Hex())
-		patch.Body += shipitTag
+		// The tag is attached after convergence pruning below: commits
+		// with pruned diffs must land untagged so they remain
+		// re-examinable.
 		// Apply filepath specific rules.
 		// Prefixes are already rewritten by the repo.
 		var diffs []git.Diff
@@ -498,8 +500,13 @@ commitsLoop:
 		// diffs no-op through three-way application while the pruned
 		// paths re-converge or resurface.
 		pruned := len(diffs) - len(kept)
-		if !*dump && pruned > 0 {
-			patch.Body = strings.TrimSuffix(patch.Body, "\n\n"+shipitTag)
+		tagged := pruned == 0
+		if tagged {
+			if patch.Body != "" {
+				patch.Body += "\n\n"
+			}
+			patch.Body += shipitTag
+		} else if !*dump {
 			log.Printf("%s: %d of %d diffs already converged; commit will remain re-examinable", c, pruned, len(diffs))
 		}
 		// Counts commits that actually moved the destination HEAD:
@@ -515,7 +522,7 @@ commitsLoop:
 		}
 		ncommit++
 		patch.Diffs = kept
-		if stripMessage {
+		if stripMessage && tagged {
 			patch.Subject = "Stripped commit"
 			patch.Body = "Commit message stripped.\n\n" + shipitTag
 		}
