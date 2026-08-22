@@ -181,7 +181,10 @@ func main() {
 			// is not silently accepted and then never matched.
 			hash := strings.ToLower(parts[1])
 			if len(hash) < 7 {
-				log.Fatalf("invalid commit prefix %s: must have at least 7 digits", parts[1])
+				log.Fatalf("invalid commit prefix %s: must have at least 7 digits", hash)
+			}
+			if len(hash) > 40 {
+				log.Fatalf("invalid commit prefix %s: longer than a full digest", hash)
 			}
 			for _, d := range hash {
 				if (d < '0' || d > '9') && (d < 'a' || d > 'f') {

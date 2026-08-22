@@ -148,7 +148,7 @@ func (r *Repo) CheckPrefixCasing(prefix string) error {
 	for _, part := range strings.Split(p, "/") {
 		args := []string{"ls-tree", "--name-only", "HEAD"}
 		if cur != "" {
-			args = append(args, "--", cur)
+			args = append(args, "--", ":(literal)"+cur)
 		}
 		out, err := r.git(nil, args...)
 		if err != nil {
@@ -464,10 +464,11 @@ func (r *Repo) Log(args ...string) (commits []*Commit, err error) {
 	}
 	out, err := r.git(nil, args...)
 	if err != nil {
-		if strings.Contains(err.Error(), "path not in the working tree") {
-			// Allow a missing destination directory, but say so: a
-			// silently empty result here would otherwise degrade
-			// prefix-scoped callers into full replays.
+		// A prefix absent from the worktree is the one tolerated
+		// failure: detect it via the filesystem rather than git's
+		// (locale-dependent) error text.
+		if _, statErr := os.Stat(filepath.Join(r.root,
+			filepath.FromSlash(strings.Trim(r.prefix, "/")))); os.IsNotExist(statErr) {
 			log.Printf("%s: prefix %q is absent; treating log as empty", r.root, r.prefix)
 			return nil, nil
 		}

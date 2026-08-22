@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"net/mail"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -142,7 +143,11 @@ func (p Patch) Write(w io.Writer) error {
 	body = strings.Replace(body, "\n+++", "\n"+zeroWidthSpace+"+++", -1)
 	fmt.Fprintf(ew, "\n%s\n---\n\n\n", body)
 	for _, diff := range p.Diffs {
-		fmt.Fprintf(ew, "diff --git a/%s b/%s\n", diff.Path, diff.Path)
+		if strings.ContainsAny(diff.Path, "\"\t\n\r") || hasControlChars(diff.Path) {
+			fmt.Fprintf(ew, "diff --git %s %s\n", quotePath("a/"+diff.Path), quotePath("b/"+diff.Path))
+		} else {
+			fmt.Fprintf(ew, "diff --git a/%s b/%s\n", diff.Path, diff.Path)
+		}
 		ew.Write(diff.Meta)
 		ew.Write([]byte{'\n'})
 		ew.Write(diff.Body)
@@ -163,6 +168,22 @@ func (p Patch) MaybeContainsLFSPointer() bool {
 		// required fields in any LFS pointer file, and any change
 		// involving a new LFS object must declare an oid.
 		if bytes.Contains(diff.Body, oid) {
+			return true
+		}
+	}
+	return false
+}
+
+// quotePath renders a path in git's C-style quoted form.
+func quotePath(p string) string {
+	return strconv.Quote(p)
+}
+
+// hasControlChars reports whether the path contains characters that
+// force git to quote it in diff headers.
+func hasControlChars(p string) bool {
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
 			return true
 		}
 	}
@@ -266,14 +287,40 @@ func foreach(b []byte, prefix string, do func(section []byte) error) error {
 	}
 }
 
-var diffHeaderRe = regexp.MustCompile(`^diff --git a/([^ ]+)`)
+var quotedDiffHeaderRe = regexp.MustCompile(`^diff --git ("a/.*") ("b/.*")$`)
 
+// parseDiffHeader extracts the repository-relative path from a
+// "diff --git" header line. Git emits two forms: symmetric unquoted
+// headers ("diff --git a/P b/P"), including for paths containing
+// spaces, and C-quoted headers ("diff --git \"a/P\" \"b/P\"") for paths
+// containing tabs, quotes or control characters. Both are parsed
+// exactly; the symmetric form is resolved by locating the " b/"
+// separator whose two halves agree.
 func parseDiffHeader(line []byte) (path []byte) {
-	g := diffHeaderRe.FindSubmatch(line)
-	if g == nil {
+	rest := bytes.TrimPrefix(line, []byte("diff --git "))
+	if !bytes.HasPrefix(rest, []byte("a/")) {
 		return nil
 	}
-	return g[1]
+	if m := quotedDiffHeaderRe.FindSubmatch(line); m != nil {
+		unquoted, err := strconv.Unquote(string(m[1]))
+		if err != nil {
+			return nil
+		}
+		return []byte(strings.TrimPrefix(unquoted, "a/"))
+	}
+	rest = rest[2:]
+	for i := 0; ; {
+		j := bytes.Index(rest[i:], []byte(" b/"))
+		if j < 0 {
+			return nil
+		}
+		j += i
+		left, right := rest[:j], rest[j+3:]
+		if bytes.Equal(left, right) {
+			return left
+		}
+		i = j + 1
+	}
 }
 
 type errWriter struct {

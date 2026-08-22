@@ -1007,3 +1007,45 @@ func TestGritCloneDirMatchesCachePath(t *testing.T) {
 		}
 	}
 }
+
+// TestV2PathsContainingSpaces pins diff-header parsing for paths with
+// spaces: modern git emits symmetric unquoted headers, and a header
+// truncated at the first space used to wedge every subsequent run. The
+// addition must apply, and an identical re-add must prune as converged.
+func TestV2PathsContainingSpaces(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	src.write("proj/sp ace.txt", "spaced\n")
+	src.commit("add file with space")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "applying") {
+		t.Fatalf("spaced path did not apply:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	// An identical file arriving at the destination through a direct
+	// commit while the source also adds it must prune as converged —
+	// proving the spaced path survives parsing end to end.
+	dst.write("sp 2.txt", "second\n")
+	dst.commit("destination adds spaced file directly")
+	dst.push()
+	src.write("proj/sp 2.txt", "second\n")
+	src.commit("source adds identical spaced file")
+	src.push()
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "skipping converged sp 2.txt") {
+		t.Fatalf("spaced-path convergence pruning did not fire:\n%s", out)
+	}
+}
