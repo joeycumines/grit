@@ -221,7 +221,12 @@ func (r *Repo) openLocked() (*Repo, error) {
 	}
 	if fresh {
 		os.MkdirAll(r.root, 0777)
-		if _, err := r.git(nil, "clone", "--single-branch", r.url, r.root); err != nil {
+		// Clone the configured branch itself: a plain --single-branch
+		// clone checks out the remote's default branch, which leaves
+		// refs/heads/<branch> missing whenever the configuration names
+		// a different branch and breaks every later local operation
+		// against it.
+		if _, err := r.git(nil, "clone", "--single-branch", "--branch", r.branch, r.url, r.root); err != nil {
 			return nil, err
 		}
 	}

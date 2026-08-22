@@ -266,7 +266,11 @@ func main() {
 	}
 
 	// Configuration mistakes that would silently mirror nothing must
-	// abort before any selection happens.
+	// abort before any selection happens. A source branch that does not
+	// resolve would degrade every selection into an empty result.
+	if _, err := src.RevParse(srcBranch); err != nil {
+		log.Fatalf("%s: source branch %q does not resolve: %v", src, srcBranch, err)
+	}
 	if err := src.CheckPrefixCasing(srcPrefix); err != nil {
 		log.Fatalf("%s: %v", src, err)
 	}

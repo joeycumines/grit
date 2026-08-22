@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+
+	gritgit "github.com/grailbio/grit/git"
 	"runtime"
 	"strings"
 	"testing"
@@ -985,4 +987,23 @@ func TestV2UntrackedLeftoverDoesNotSilenceAddition(t *testing.T) {
 	}
 	dst.pull()
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+}
+
+// TestGritCloneDirMatchesCachePath pins the test helper's clone-path
+// derivation against grit's own: drift between them would silently
+// mislocate paused sessions in every session-related test.
+func TestGritCloneDirMatchesCachePath(t *testing.T) {
+	t.Setenv("TEST_TMPDIR", t.TempDir())
+	const url = "https://example.com/mirror.git"
+	for _, tc := range []struct{ prefix, branch string }{
+		{"", "main"},
+		{"proj/", "main"},
+		{"proj/", "feature"},
+	} {
+		got := filepath.Base(gritCloneDir(t, url, tc.prefix, tc.branch))
+		want := filepath.Base(gritgit.CachePath(url, tc.prefix, tc.branch))
+		if got != want {
+			t.Errorf("gritCloneDir(%q,%q) base = %s, want git.CachePath base = %s", tc.prefix, tc.branch, got, want)
+		}
+	}
 }

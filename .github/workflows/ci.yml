@@ -8,8 +8,13 @@ on:
 
 jobs:
   build:
-    name: Build
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # macos runners exercise case-insensitive filesystem paths,
+        # symlink semantics, and executable-bit handling end to end.
+        os: [ubuntu-latest, macos-latest]
     steps:
     - name: Set up Go
       uses: actions/setup-go@v4
