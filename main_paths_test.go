@@ -10,13 +10,13 @@ import (
 	"testing"
 )
 
-// TestV2CaseOnlyRenameIsNotPruned pins case-sensitive path resolution in
+// TestCaseOnlyRenameIsNotPruned pins case-sensitive path resolution in
 // convergence pruning: on case-insensitive filesystems, a case-only
 // rename serializes as delete+add, and the add half must not be pruned
 // just because the OS resolves it to the differently-cased existing
 // file. Without exact-name matching, the destination silently loses the
 // file.
-func TestV2CaseOnlyRenameIsNotPruned(t *testing.T) {
+func TestCaseOnlyRenameIsNotPruned(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -48,12 +48,12 @@ func TestV2CaseOnlyRenameIsNotPruned(t *testing.T) {
 	}
 }
 
-// TestV2CaseOnlySubdirRenameIsNotPruned pins case sensitivity for
+// TestCaseOnlySubdirRenameIsNotPruned pins case sensitivity for
 // intermediate path components: a case-only SUBDIRECTORY rename arrives
 // as delete+add, and on a case-insensitive host the add half resolves
 // through the still-existing old-case directory. Pruning it would
 // silently drop the file; it must be applied instead.
-func TestV2CaseOnlySubdirRenameIsNotPruned(t *testing.T) {
+func TestCaseOnlySubdirRenameIsNotPruned(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -83,10 +83,10 @@ func TestV2CaseOnlySubdirRenameIsNotPruned(t *testing.T) {
 	}
 }
 
-// TestV2CaseMismatchedPrefixAborts pins that a configured prefix whose
+// TestCaseMismatchedPrefixAborts pins that a configured prefix whose
 // letter case does not match the repository's paths aborts loudly
 // instead of silently dropping every diff on case-insensitive hosts.
-func TestV2CaseMismatchedPrefixAborts(t *testing.T) {
+func TestCaseMismatchedPrefixAborts(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",PROJ/," + testBranch
@@ -102,11 +102,11 @@ func TestV2CaseMismatchedPrefixAborts(t *testing.T) {
 	}
 }
 
-// TestV2PathsContainingSpaces pins diff-header parsing for paths with
+// TestPathsContainingSpaces pins diff-header parsing for paths with
 // spaces: modern git emits symmetric unquoted headers, and a header
 // truncated at the first space used to wedge every subsequent run. The
 // addition must apply, and an identical re-add must prune as converged.
-func TestV2PathsContainingSpaces(t *testing.T) {
+func TestPathsContainingSpaces(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -144,11 +144,11 @@ func TestV2PathsContainingSpaces(t *testing.T) {
 	}
 }
 
-// TestV2QuotedPathRoundTrip covers paths git C-quotes in diff headers
+// TestQuotedPathRoundTrip covers paths git C-quotes in diff headers
 // (non-ASCII bytes): the addition must apply through grit's quoted
 // parsing and emission, and an identical arrival at the destination
 // must prune as converged.
-func TestV2QuotedPathRoundTrip(t *testing.T) {
+func TestQuotedPathRoundTrip(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -186,10 +186,10 @@ func TestV2QuotedPathRoundTrip(t *testing.T) {
 	}
 }
 
-// TestV2CaseMismatchedPrefixComponentAborts covers multi-component
+// TestCaseMismatchedPrefixComponentAborts covers multi-component
 // prefixes: a wrong-cased intermediate component must abort loudly even
 // though tree-level pathspecs would silently select nothing.
-func TestV2CaseMismatchedPrefixComponentAborts(t *testing.T) {
+func TestCaseMismatchedPrefixComponentAborts(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",PROJ/sub/," + testBranch
@@ -205,11 +205,11 @@ func TestV2CaseMismatchedPrefixComponentAborts(t *testing.T) {
 	}
 }
 
-// TestV2NonASCIIPrefixComponentCasing pins CheckPrefixCasing against
+// TestNonASCIIPrefixComponentCasing pins CheckPrefixCasing against
 // core.quotePath escaping: a correctly spelled non-ASCII prefix
 // component must be recognized (sync proceeds), and its case-typo must
 // abort loudly.
-func TestV2NonASCIIPrefixComponentCasing(t *testing.T) {
+func TestNonASCIIPrefixComponentCasing(t *testing.T) {
 	for _, tc := range []struct {
 		prefix    string
 		wantAbort bool

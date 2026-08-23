@@ -12,11 +12,11 @@ import (
 	"testing"
 )
 
-// TestV2SessionPauseResume verifies the persistent conflict lifecycle: a
+// TestSessionPauseResume verifies the persistent conflict lifecycle: a
 // genuine conflict pauses the session; a fresh grit invocation preserves
 // it; manual resolution plus am --continue persists; and the next grit
 // invocation pushes the resolved session.
-func TestV2SessionPauseResume(t *testing.T) {
+func TestSessionPauseResume(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -77,12 +77,12 @@ func TestV2SessionPauseResume(t *testing.T) {
 	}
 }
 
-// TestV2UnbornSourceFailsLoudly documents the pre-existing contract that
+// TestUnbornSourceFailsLoudly documents the pre-existing contract that
 // grit cannot synchronize from a repository without any commits: Open
 // fails loudly at fetch ("couldn't find remote ref"), identical to
 // pristine upstream d3b81e6 behavior. Object seeding therefore only ever
 // runs for sources whose branch exists.
-func TestV2UnbornSourceFailsLoudly(t *testing.T) {
+func TestUnbornSourceFailsLoudly(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -102,11 +102,11 @@ func TestV2UnbornSourceFailsLoudly(t *testing.T) {
 	}
 }
 
-// TestV2PauseWithoutPushThenPushLater verifies that a conflict paused by
+// TestPauseWithoutPushThenPushLater verifies that a conflict paused by
 // a plain (non -push) run persists for resolution, and that a later
 // push-enabled run publishes the resolved session — the other half of
 // the preservation heuristic.
-func TestV2PauseWithoutPushThenPushLater(t *testing.T) {
+func TestPauseWithoutPushThenPushLater(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -155,10 +155,10 @@ func TestV2PauseWithoutPushThenPushLater(t *testing.T) {
 	}
 }
 
-// TestV2ForeignUnpushedStateAborts verifies that unpushed commits in the
+// TestForeignUnpushedStateAborts verifies that unpushed commits in the
 // destination clone that grit did not author (no shipit id at HEAD) abort
 // the run loudly instead of being preserved and later published.
-func TestV2ForeignUnpushedStateAborts(t *testing.T) {
+func TestForeignUnpushedStateAborts(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -188,11 +188,11 @@ func TestV2ForeignUnpushedStateAborts(t *testing.T) {
 	}
 }
 
-// TestV2SourceCloneStrayStateIsDiscarded verifies the source clone's
+// TestSourceCloneStrayStateIsDiscarded verifies the source clone's
 // read-through-cache contract: stray local commits (e.g. residue of a
 // linearized run) never abort or leak into synchronization; the next
 // run discards them and mirrors the remote tip.
-func TestV2SourceCloneStrayStateIsDiscarded(t *testing.T) {
+func TestSourceCloneStrayStateIsDiscarded(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -234,11 +234,11 @@ func TestV2SourceCloneStrayStateIsDiscarded(t *testing.T) {
 	}
 }
 
-// TestV2IndentedQuotationIsNotGritAuthored verifies that the
+// TestIndentedQuotationIsNotGritAuthored verifies that the
 // preservation gate's stricter flush-left requirement rejects a foreign
 // unpushed commit whose message merely quotes an id from an indented
 // block (which Log's dedentation would otherwise resurrect).
-func TestV2IndentedQuotationIsNotGritAuthored(t *testing.T) {
+func TestIndentedQuotationIsNotGritAuthored(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
 	srcSpec := src.bare + ",proj/," + testBranch
