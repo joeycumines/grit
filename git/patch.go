@@ -52,6 +52,7 @@ func (d Diff) NewBlob() (string, bool) {
 		if i := strings.IndexByte(newBlob, ' '); i >= 0 {
 			newBlob = newBlob[:i]
 		}
+		newBlob = strings.TrimSpace(newBlob)
 		if newBlob == "" {
 			return "", false
 		}
@@ -67,9 +68,12 @@ func (d Diff) NewBlob() (string, bool) {
 // absence of any recognizable mode metadata.
 func (d Diff) NewMode() (string, bool) {
 	var fromIndex string
+	isDeleted := false
 	for _, line := range bytes.Split(d.Meta, []byte("\n")) {
 		line := string(line)
 		switch {
+		case strings.HasPrefix(line, "deleted file mode "):
+			isDeleted = true
 		case strings.HasPrefix(line, "new file mode "):
 			return strings.TrimSpace(line[len("new file mode "):]), true
 		case strings.HasPrefix(line, "new mode "):
@@ -79,10 +83,13 @@ func (d Diff) NewMode() (string, bool) {
 			if i := strings.Index(rest, ".."); i >= 0 {
 				rest = rest[i+2:]
 				if j := strings.IndexByte(rest, ' '); j >= 0 {
-					fromIndex = rest[j+1:]
+					fromIndex = strings.TrimSpace(rest[j+1:])
 				}
 			}
 		}
+	}
+	if isDeleted {
+		return "", false
 	}
 	if fromIndex != "" {
 		return fromIndex, true
@@ -335,6 +342,11 @@ var quotedDiffHeaderRe = regexp.MustCompile(`^diff --git ("a/.*") ("b/.*")$`)
 // exactly; the symmetric form is resolved by locating the " b/"
 // separator whose two halves agree.
 func parseDiffHeader(line []byte) (path []byte) {
+	// CRLF-contaminated patch text (e.g. mboxes round-tripped through
+	// Windows tooling) leaves a trailing carriage return on every line;
+	// it participates in neither the quoted regex's $ anchor nor the
+	// symmetric form's left/right equality, so strip it up front.
+	line = bytes.TrimSuffix(line, []byte{'\r'})
 	// The C-quoted form must be tried first: it begins with a quote, so
 	// the symmetric branch's "a/" prefix test can never reach it.
 	if m := quotedDiffHeaderRe.FindSubmatch(line); m != nil {

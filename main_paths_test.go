@@ -10,6 +10,41 @@ import (
 	"testing"
 )
 
+// TestUnslashedPrefixDoesNotCaptureBoundarySiblings pins directory-
+// boundary containment for prefixes written without a trailing slash:
+// a diff for "project.txt" shares a string prefix with "proj" but lies
+// outside its scope. Bare HasPrefix containment mangled such paths via
+// TrimPrefix into phantom destination files; they must be dropped as
+// out-of-scope while genuine proj/ content still syncs.
+func TestUnslashedPrefixDoesNotCaptureBoundarySiblings(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/f.txt", "in scope\n")
+	src.write("project.txt", "boundary sibling\n")
+	src.write("prose.txt", "unrelated\n")
+	src.commit("first commit")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "pushing changes") {
+		t.Fatalf("sync did not complete:\n%s", out)
+	}
+	dst.pull()
+	tracked := dst.gitOut("ls-files")
+	entries := strings.Split(strings.TrimSpace(tracked), "\n")
+	if len(entries) != 1 || entries[0] != "f.txt" {
+		t.Fatalf("destination must hold exactly f.txt; tracked:\n%s", tracked)
+	}
+	for _, phantom := range []string{"ect.txt", "project.txt", "prose.txt"} {
+		if strings.Contains(tracked, phantom) {
+			t.Fatalf("out-of-scope path leaked into destination as %q; tracked:\n%s", phantom, tracked)
+		}
+	}
+}
+
 // TestCaseOnlyRenameIsNotPruned pins case-sensitive path resolution in
 // convergence pruning: on case-insensitive filesystems, a case-only
 // rename serializes as delete+add, and the add half must not be pruned
@@ -96,7 +131,7 @@ func TestCaseMismatchedPrefixAborts(t *testing.T) {
 	src.commit("first commit")
 	src.push()
 
-	out := gritOutput(t, src.gritBin, "-push", srcSpec, dstSpec)
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
 	if !strings.Contains(out, "letter case") {
 		t.Fatalf("case-mismatched prefix did not abort loudly:\n%s", out)
 	}

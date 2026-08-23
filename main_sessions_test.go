@@ -234,6 +234,54 @@ func TestSourceCloneStrayStateIsDiscarded(t *testing.T) {
 	}
 }
 
+// TestDivergedGritTailIsDiscardedNotPreserved pins the ancestry gate
+// end-to-end: an all-grit-authored unpushed tail whose base has
+// diverged from the advanced remote tip can never be pushed (every
+// push fails non-fast-forward), so Open must discard and reclone
+// immediately — letting the run converge against the actual remote tip
+// — instead of preserving the tail until a doomed push discards it.
+func TestDivergedGritTailIsDiscardedNotPreserved(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1\n")
+	src.commit("first source change")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Pending source work for the recovery run.
+	src.write("proj/next.txt", "v2\n")
+	src.commit("second source change")
+	src.push()
+
+	// The destination remote advances independently, so any unpushed
+	// clone tail on the old base stops descending from the remote tip.
+	dst.write("only.txt", "diverged\n")
+	dst.commit("destination diverges")
+	dst.push()
+
+	// An entirely grit-authored unpushed tail sits on the stale base.
+	clone := gritCloneDir(t, dst.bare, "", testBranch)
+	runGit(t, clone, "-c", "user.email=t@e", "-c", "user.name=t",
+		"commit", "--allow-empty", "-m",
+		"resolved session\n\nfbshipit-source-id: 0123456789abcdef0123456789abcdef01234567\n")
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "discarding stale clone cache") {
+		t.Fatalf("diverged grit-authored tail was preserved instead of discarded:\n%s", out)
+	}
+	dst.pull()
+	if got := dstRead(t, dst.dir, "next.txt"); got != "v2\n" {
+		t.Fatalf("pending source change did not land after recovery: %q", got)
+	}
+	if got := dstRead(t, dst.dir, "only.txt"); got != "diverged\n" {
+		t.Fatalf("remote divergence clobbered during recovery: %q", got)
+	}
+}
+
 // TestIndentedQuotationIsNotGritAuthored verifies that the
 // preservation gate's stricter flush-left requirement rejects a foreign
 // unpushed commit whose message merely quotes an id from an indented

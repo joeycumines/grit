@@ -344,6 +344,423 @@ func TestLFS(t *testing.T) {
 	}
 }
 
+func TestResetToRemoteUsesOriginHead(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	if *nocleanup {
+		log.Println("directory", dir)
+	} else {
+		defer cleanup()
+	}
+	shell(t, dir, `
+		git init --bare dst.git
+		git clone dst.git dst
+		cd dst
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo dst1 > file.txt
+		git add file.txt
+		git commit -m'dst1'
+		git push origin master
+		cd ..
+		git init --bare src.git
+		git clone src.git src
+		cd src
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo src1 > file.txt
+		git add file.txt
+		git commit -m'src1'
+		git push origin master
+	`)
+	dstRepo, err := Open(filepath.Join(dir, "dst.git"), "", "master")
+	if err != nil {
+		t.Fatalf("open dst: %v", err)
+	}
+	defer dstRepo.Close()
+	originHead := dstRepo.OriginHead()
+	if originHead == "" {
+		t.Fatalf("originHead empty")
+	}
+	shell(t, dir, `
+		git -C `+dstRepo.RepoRoot()+` config user.email you@example.com
+		git -C `+dstRepo.RepoRoot()+` config user.name "your name"
+		echo local > `+dstRepo.RepoRoot()+`/local.txt
+		git -C `+dstRepo.RepoRoot()+` add local.txt
+		git -C `+dstRepo.RepoRoot()+` commit -m'local dst commit'
+	`)
+	if err := dstRepo.FetchObjects(filepath.Join(dir, "src.git"), "master"); err != nil {
+		t.Fatalf("FetchObjects: %v", err)
+	}
+	// FetchObjects deliberately clobbers FETCH_HEAD with the source tip
+	// (no --no-write-fetch-head: that flag needs git >= 2.29 and nothing
+	// reads FETCH_HEAD after open captures the snapshot). The invariant
+	// under test is that ResetToRemote ignores the clobbered file and
+	// restores the captured destination tip.
+	fetchHead, err := dstRepo.RevParse("FETCH_HEAD")
+	if err != nil {
+		t.Fatalf("FETCH_HEAD: %v", err)
+	}
+	srcHead, err := dstRepo.RevParse("refs/grit/src")
+	if err != nil {
+		t.Fatalf("refs/grit/src: %v", err)
+	}
+	if fetchHead != srcHead {
+		t.Fatalf("test setup drifted: FETCH_HEAD %s != seeded source tip %s", fetchHead, srcHead)
+	}
+	if err := dstRepo.ResetToRemote(); err != nil {
+		t.Fatalf("ResetToRemote: %v", err)
+	}
+	head, err := dstRepo.Head()
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	if head != originHead {
+		t.Fatalf("ResetToRemote reset to %s (FETCH_HEAD holds source tip %s), want originHead %s", head, fetchHead, originHead)
+	}
+	if head == srcHead {
+		t.Fatalf("ResetToRemote incorrectly reset to source tip %s", srcHead)
+	}
+	if _, err := os.Stat(filepath.Join(dstRepo.RepoRoot(), "local.txt")); !os.IsNotExist(err) {
+		t.Fatalf("local.txt still exists after reset, should have been discarded")
+	}
+}
+
+func TestPatchIsEmptyWithDiffStringInMessage(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	if *nocleanup {
+		log.Println("directory", dir)
+	} else {
+		defer cleanup()
+	}
+	shell(t, dir, `
+		git init --bare repo.git
+		git clone repo.git checkout
+		cd checkout
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo hello > file.txt
+		git add file.txt
+		git commit -m'first'
+		git push
+		cd ..
+		git clone repo.git checkout2
+		cd checkout2
+		git config user.email you@example.com
+		git config user.name "your name"
+		git commit --allow-empty -m'empty commit with diff --git in body
+
+This message mentions diff --git a/foo b/foo inside prose
+and also has --- marker'
+		git push
+	`)
+	repo, err := Open(filepath.Join(dir, "checkout2"), "", "master")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	commits, err := repo.LogIgnoringPrefix("--all")
+	if err != nil {
+		t.Fatalf("log: %v", err)
+	}
+	var emptyID string
+	for _, c := range commits {
+		if c.Title() == "empty commit with diff --git in body" {
+			emptyID = c.Digest.Hex()
+			break
+		}
+	}
+	if emptyID == "" {
+		t.Fatalf("empty commit not found")
+	}
+	empty, err := repo.PatchIsEmpty(emptyID)
+	if err != nil {
+		t.Fatalf("PatchIsEmpty: %v", err)
+	}
+	if !empty {
+		t.Fatalf("PatchIsEmpty returned false for empty commit containing diff --git in message, want true")
+	}
+	var nonEmptyID string
+	for _, c := range commits {
+		if c.Title() == "first" {
+			nonEmptyID = c.Digest.Hex()
+			break
+		}
+	}
+	nonEmpty, err := repo.PatchIsEmpty(nonEmptyID)
+	if err != nil {
+		t.Fatalf("PatchIsEmpty non-empty: %v", err)
+	}
+	if nonEmpty {
+		t.Fatalf("PatchIsEmpty returned true for non-empty commit, want false")
+	}
+}
+
+func TestOwnLineConvergenceMarkers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "plain",
+			body: "subject\n\ngrit-convergence-pruned: 1/2\n",
+			want: []string{"1/2"},
+		},
+		{
+			name: "crlf terminated",
+			body: "subject\n\ngrit-convergence-pruned: 12/34\r\n",
+			want: []string{"12/34"},
+		},
+		{
+			name: "multiple mixed endings",
+			body: "grit-convergence-pruned: 1/2\r\nprose\ngrit-convergence-pruned: 3/4\n",
+			want: []string{"1/2", "3/4"},
+		},
+		{
+			name: "indented quotation is not own-line",
+			body: "  grit-convergence-pruned: 9/9\n",
+			want: nil,
+		},
+		{
+			name: "no markers",
+			body: "plain body\n",
+			want: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Commit{Body: tc.body}
+			got := c.OwnLineConvergenceMarkers()
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %q, want %q", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestPathInPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		p, prefix string
+		want      bool
+	}{
+		{"docs.txt", "docs", false},
+		{"docs/x", "docs", true},
+		{"docs", "docs", true},
+		{"docs/", "docs/", true},
+		{"docs/x", "docs/", true},
+		{"docs.txt", "docs/", false},
+		{"docsx/y", "docs/", false},
+		{"adir/file1", "adir/", true},
+		{"other/file1", "adir/", false},
+		{"anything", "", true},
+	} {
+		if got := pathInPrefix(tc.p, tc.prefix); got != tc.want {
+			t.Errorf("pathInPrefix(%q, %q) = %v, want %v", tc.p, tc.prefix, got, tc.want)
+		}
+	}
+}
+
+func TestIsCaseMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		diffPath, prefix string
+		want             bool
+	}{
+		{"Foo/bar", "foo", true},
+		{"foo/bar", "foo", false},
+		{"foobar", "foo", false},
+		{"Foobar", "foo", false},
+		{"Foo", "foo", true},
+		{"foo", "foo", false},
+		{"FOO", "foo", true},
+		{"Foo/bar", "foo/", true},
+		{"foo/bar", "foo/", false},
+		{"foobar", "foo/", false},
+		{"ς/x", "Σ/", true},
+		{"σ/x", "Σ/", true},
+		{"Σ/x", "Σ/", false},
+		{"Föo/x", "föo", true},
+		{"föo/x", "föo", false},
+		{"föobar", "föo", false},
+		{"short", "longer-prefix", false},
+		{"", "foo", false},
+		{"foo", "", false},
+	} {
+		if got := isCaseMismatch(tc.diffPath, tc.prefix); got != tc.want {
+			t.Errorf("isCaseMismatch(%q, %q) = %v, want %v", tc.diffPath, tc.prefix, got, tc.want)
+		}
+	}
+}
+
+// TestPatchIsEmptyWhitespacePathname pins that a commit whose only
+// change is a file named entirely of whitespace is not misclassified
+// as empty: git permits such names, and trimming diff-tree's raw
+// path output erased the only evidence of the change.
+func TestPatchIsEmptyWhitespacePathname(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	if *nocleanup {
+		log.Println("directory", dir)
+	} else {
+		defer cleanup()
+	}
+	shell(t, dir, `
+		git init --bare repo.git
+		git clone repo.git checkout
+		cd checkout
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo hello > file.txt
+		git add file.txt
+		git commit -m'first'
+		git push
+		cd ..
+		git clone repo.git checkout2
+		cd checkout2
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo spaced > ' '
+		git add ' '
+		git commit -m'whitespace pathname change'
+		git push
+	`)
+	repo, err := Open(filepath.Join(dir, "checkout2"), "", "master")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	commits, err := repo.LogIgnoringPrefix("--all")
+	if err != nil {
+		t.Fatalf("log: %v", err)
+	}
+	var wsID string
+	for _, c := range commits {
+		if c.Title() == "whitespace pathname change" {
+			wsID = c.Digest.Hex()
+			break
+		}
+	}
+	if wsID == "" {
+		t.Fatalf("whitespace-pathname commit not found")
+	}
+	empty, err := repo.PatchIsEmpty(wsID)
+	if err != nil {
+		t.Fatalf("PatchIsEmpty: %v", err)
+	}
+	if empty {
+		t.Fatalf("PatchIsEmpty returned true for commit changing file named ' ', want false")
+	}
+}
+
+const gritAuthoredMessage = "resolved session\n\nfbshipit-source-id: 0123456789abcdef0123456789abcdef01234567\n"
+
+// TestPreservedTailRequiresRemoteAncestry pins the preservation gate's
+// scope: an unpushed tail qualifies for preservation only when it
+// descends from the provided remote tip. A diverged tail (sharing only
+// a deeper merge base) can never be pushed — every push fails
+// non-fast-forward — so it must report unpreservable and let the caller
+// reclone, instead of deferring the loss to a doomed push cycle.
+func TestPreservedTailRequiresRemoteAncestry(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	if *nocleanup {
+		log.Println("directory", dir)
+	} else {
+		defer cleanup()
+	}
+	shell(t, dir, `
+		git init --bare repo.git
+		git clone repo.git w1
+		cd w1
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > f.txt
+		git add f.txt
+		git commit -m'base'
+		git push
+		cd ..
+		git clone repo.git w2
+		cd w2
+		git config user.email you@example.com
+		git config user.name "your name"
+	`)
+	base, err := exec.Command("git", "-C", filepath.Join(dir, "w2"), "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse base: %v\n%s", err, base)
+	}
+	baseHex := strings.TrimSpace(string(base))
+
+	// Local grit-authored commit: strictly ahead of the remote tip.
+	shell(t, dir, `
+		cd `+filepath.Join(dir, "w2")+`
+		echo local > resolved.txt
+		git add resolved.txt
+		git commit -m'`+gritAuthoredMessage+`'
+	`)
+
+	// Independent remote advance: the histories are now diverged.
+	shell(t, dir, `
+		cd `+filepath.Join(dir, "w1")+`
+		echo r1 > advanced.txt
+		git add advanced.txt
+		git commit -m'remote advance'
+		git push
+	`)
+
+	r := &Repo{url: filepath.Join(dir, "repo.git"), root: filepath.Join(dir, "w2"), prefix: "", branch: "master"}
+
+	authored, err := r.PreservedTailIsGritAuthored(baseHex)
+	if err != nil {
+		t.Fatalf("strictly-ahead: %v", err)
+	}
+	if !authored {
+		t.Fatal("strictly-ahead grit-authored tail must be preserved")
+	}
+
+	out, err := exec.Command("git", "-C", filepath.Join(dir, "w1"), "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse advanced: %v\n%s", err, out)
+	}
+	divergedHex := strings.TrimSpace(string(out))
+	// Mirror openLocked, which always fetches before the gate runs:
+	// without the fetch the advanced tip is unknown here and
+	// merge-base would fail for missing-object reasons instead of
+	// answering the ancestry question.
+	shell(t, dir, `
+		git -C `+filepath.Join(dir, "w2")+` fetch -q origin
+	`)
+	authored, err = r.PreservedTailIsGritAuthored(divergedHex)
+	if err != nil {
+		t.Fatalf("diverged: %v", err)
+	}
+	if authored {
+		t.Fatal("diverged tail (merge base below remote tip) must not be preserved; a later push could never succeed")
+	}
+
+	// Unrelated history: nothing local descends from such a tip either.
+	shell(t, dir, `
+		git init --bare unrelated.git
+		git clone unrelated.git u
+		cd u
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo other > other.txt
+		git add other.txt
+		git commit -m'unrelated root'
+	`)
+	out, err = exec.Command("git", "-C", filepath.Join(dir, "u"), "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse unrelated: %v\n%s", err, out)
+	}
+	unrelatedHex := strings.TrimSpace(string(out))
+	authored, err = r.PreservedTailIsGritAuthored(unrelatedHex)
+	if err != nil {
+		t.Fatalf("unrelated: %v", err)
+	}
+	if authored {
+		t.Fatal("unrelated history must not be preserved")
+	}
+}
+
 func shell(t *testing.T, dir, script string) {
 	t.Helper()
 	cmd := exec.Command("bash", "-e", "-x")

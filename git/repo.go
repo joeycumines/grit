@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -161,12 +162,11 @@ func (r *Repo) CheckPrefixCasing(prefix string) error {
 	}
 	cur := ""
 	for _, part := range strings.Split(p, "/") {
-		// -z yields NUL-separated entries without core.quotePath
-		// escaping, so non-ASCII and control-character components
-		// compare byte-for-byte.
-		args := []string{"-c", "core.quotePath=false", "ls-tree", "-z", "--name-only", "HEAD"}
-		if cur != "" {
-			args = append(args, "--", ":(literal)"+cur)
+		var args []string
+		if cur == "" {
+			args = []string{"-c", "core.quotePath=false", "ls-tree", "-z", "--name-only", "HEAD"}
+		} else {
+			args = []string{"-c", "core.quotePath=false", "ls-tree", "-z", "--name-only", "HEAD:" + strings.TrimSuffix(cur, "/")}
 		}
 		out, err := r.git(nil, args...)
 		if err != nil {
@@ -180,7 +180,7 @@ func (r *Repo) CheckPrefixCasing(prefix string) error {
 			if entry == "" {
 				continue
 			}
-			name := filepath.Base(entry)
+			name := path.Base(entry)
 			if name == part {
 				found = true
 				break
@@ -199,6 +199,51 @@ func (r *Repo) CheckPrefixCasing(prefix string) error {
 		cur = cur + part + "/"
 	}
 	return nil
+}
+
+// pathInPrefix reports whether p lies within prefix's scope: equal to
+// it, or nested beneath it when the prefix is slash-terminated or the
+// next path byte is a slash. A bare string-prefix match ("docs"
+// matching "docs.txt") must not count as containment: TrimPrefix would
+// mangle such a path into a phantom sibling of the prefix directory.
+func pathInPrefix(p, prefix string) bool {
+	if prefix == "" {
+		return true
+	}
+	if !strings.HasPrefix(p, prefix) {
+		return false
+	}
+	return len(p) == len(prefix) || strings.HasSuffix(prefix, "/") || p[len(prefix)] == '/'
+}
+
+// isCaseMismatch reports whether diffPath falls within prefix's scope
+// but differs from it by letter case alone — a state that tree-level
+// matching silently drops and that must therefore abort loudly.
+// Comparison is rune-wise simple case folding without any lowercasing
+// precheck, so fold-equivalent scripts (Greek sigma variants) count as
+// case differences. The span must respect the same directory boundary
+// as pathInPrefix; byte inequality of the leading span then
+// distinguishes genuine mismatches from exact matches, which report
+// false.
+func isCaseMismatch(diffPath, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	prefixRunes := []rune(prefix)
+	diffRunes := []rune(diffPath)
+	if len(diffRunes) < len(prefixRunes) {
+		return false
+	}
+	for i, r := range prefixRunes {
+		if !strings.EqualFold(string(diffRunes[i]), string(r)) {
+			return false
+		}
+	}
+	if len(diffRunes) > len(prefixRunes) &&
+		prefixRunes[len(prefixRunes)-1] != '/' && diffRunes[len(prefixRunes)] != '/' {
+		return false
+	}
+	return string(diffRunes[:len(prefixRunes)]) != prefix
 }
 
 // openLocked performs the open while the repository's lock is held.
@@ -249,7 +294,10 @@ func (r *Repo) openLocked() (*Repo, error) {
 		return nil, err
 	}
 	// Capture the remote tip now: any later fetch (e.g. object seeding)
-	// overwrites FETCH_HEAD, so this is the only reliable moment.
+	// overwrites FETCH_HEAD. Nothing re-reads FETCH_HEAD afterwards —
+	// ResetToRemote uses this snapshot — so the overwrite is harmless,
+	// which keeps grit compatible with git versions lacking
+	// --no-write-fetch-head.
 	originHead, err := r.RevParse("FETCH_HEAD")
 	if err != nil {
 		return nil, err
@@ -310,7 +358,7 @@ func (r *Repo) openLocked() (*Repo, error) {
 		}
 	}
 	_, _ = r.git(nil, "am", "--abort")
-	if _, err := r.git(nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
+	if _, err := r.git(nil, "reset", "--hard", r.originHead); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -352,9 +400,9 @@ func (r *Repo) OriginHead() string {
 	return r.originHead
 }
 
-var ownLineShipitIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a-z0-9]+)$`)
+var ownLineShipitIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a-z0-9]+)\r?$`)
 
-var ownLineGritTagRe = regexp.MustCompile(`(?m)^fbshipit-source-id: ([a-z0-9]+)$`)
+var ownLineGritTagRe = regexp.MustCompile(`(?m)^fbshipit-source-id: ([a-z0-9]+)\r?$`)
 
 // OwnLineShipitIDs returns the shipit source ids recorded on their own
 // lines in the commit message — the form grit writes. Matching anywhere
@@ -383,49 +431,50 @@ func (c *Commit) OwnLineGritTagIDs() []string {
 	return ids
 }
 
-var ownLineConvergenceMarkerRe = regexp.MustCompile(`(?m)^grit-convergence-pruned: ([0-9]+)/([0-9]+)$`)
+var ownLineConvergenceMarkerRe = regexp.MustCompile(`(?m)^grit-convergence-pruned: ([0-9]+)/([0-9]+)\r?$`)
 
 // OwnLineConvergenceMarkers reports the convergence-pruned markers grit
 // writes on commits whose converged diffs were deliberately left
 // untagged — the second serialization the authorship gates accept.
+// Each entry is the clean "old/new" id pair; line-ending bytes never
+// leak into the returned values, matching OwnLineShipitIDs and
+// OwnLineGritTagIDs.
 func (c *Commit) OwnLineConvergenceMarkers() []string {
 	var markers []string
 	for _, match := range ownLineConvergenceMarkerRe.FindAllStringSubmatch(c.Body, -1) {
-		markers = append(markers, match[0])
+		markers = append(markers, match[1]+"/"+match[2])
 	}
 	return markers
 }
 
 // PreservedTailIsGritAuthored reports whether every commit between the
 // provided origin tip and HEAD is state grit itself created: carrying
-// either a shipit source id or a convergence-pruned marker. When the
-// origin tip is not reachable from HEAD (an unrelated rebuilt history),
-// the outcome depends on the scan: a tail composed entirely of
-// grit-authored commits indicates stale-but-rederivable cache state;
-// any non-authored commit indicates foreign state.
+// either a shipit source id or a convergence-pruned marker. The origin
+// tip must be an ancestor of HEAD; a tail sharing only a deeper merge
+// base has diverged from the remote tip and can never be pushed (every
+// push fails non-fast-forward), so it reports false like any other
+// unpreservable lineage rather than deferring the loss to a doomed
+// push cycle. Unrelated histories report false as well: nothing held
+// locally descends from such a tip.
 func (r *Repo) PreservedTailIsGritAuthored(originHead string) (bool, error) {
-	commits, err := r.LogIgnoringPrefix("HEAD")
+	mbOut, err := r.git(nil, "merge-base", originHead, "HEAD")
+	if err != nil {
+		// Between valid revisions a merge-base failure means unrelated
+		// histories (the reading IsAncestor documents); nothing local
+		// descends from the remote tip.
+		return false, nil
+	}
+	if mb := strings.TrimSpace(string(mbOut)); mb != originHead {
+		return false, nil
+	}
+	commits, err := r.LogIgnoringPrefix(originHead + "..HEAD")
 	if err != nil {
 		return false, err
 	}
-	// Authorship here uses grit's exact serialization (flush-left,
-	// fb-prefixed) or the convergence-pruned marker: Log's blanket
-	// four-space dedentation would otherwise resurrect indented prose
-	// quotations as authoritative ids.
-	sawOrigin := false
-	allAuthored := true
 	for _, c := range commits {
-		if c.Digest.Hex() == originHead {
-			sawOrigin = true
-			break
-		}
 		if len(c.OwnLineGritTagIDs()) == 0 && len(c.OwnLineConvergenceMarkers()) == 0 {
-			allAuthored = false
-			break
+			return false, nil
 		}
-	}
-	if !sawOrigin {
-		return allAuthored, nil
 	}
 	return true, nil
 }
@@ -642,53 +691,24 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 	if err != nil {
 		return Patch{}, err
 	}
-	fixPath := func(path string) string {
-		return dstPrefix + strings.TrimPrefix(path, r.prefix)
+	fixPath := func(p string) string {
+		// Strip the prefix, then a directory separator exposed by an
+		// unslash-terminated source prefix ("proj" against "proj/f.txt"
+		// leaves "/f.txt"); destination paths must be relative, whatever
+		// spelling the source prefix used.
+		rest := strings.TrimPrefix(p, r.prefix)
+		return dstPrefix + strings.TrimPrefix(rest, "/")
 	}
 
 	var diffs []Diff
 	for _, diff := range patch.Diffs {
-		if strings.HasPrefix(diff.Path, r.prefix) {
+		if pathInPrefix(diff.Path, r.prefix) {
 			diff.Path = fixPath(diff.Path)
 			// Also rewrite any --- or +++ meta lines that begin with a/ or b/,
 			// since they are also paths. The rest of meta is opaque to us.
-			meta := diff.Meta
-			diff.Meta = nil
-			for meta != nil {
-				line := scanLine(&meta)
-				switch {
-				case bytes.HasPrefix(line, prefixA) || bytes.HasPrefix(line, prefixB):
-					path := []byte(fixPath(string(line[len(prefixA):])))
-					diff.Meta = append(diff.Meta, line[:len(prefixA)]...)
-					diff.Meta = append(diff.Meta, path...)
-					diff.Meta = append(diff.Meta, '\n')
-				case bytes.HasPrefix(line, []byte(`--- "a/`)), bytes.HasPrefix(line, []byte(`+++ "b/`)):
-					// C-quoted form: `--- "a/P"` / `+++ "b/P"`. The
-					// escaped path is decoded, rewritten, and re-emitted
-					// in git's exact quoting grammar.
-					escaped := strings.TrimSuffix(string(line[7:]), `"`)
-					unquoted, err := strconv.Unquote(`"` + escaped + `"`)
-					if err != nil {
-						diff.Meta = append(diff.Meta, line...)
-						diff.Meta = append(diff.Meta, '\n')
-						break
-					}
-					side := "a"
-					if bytes.HasPrefix(line, []byte("+++")) {
-						side = "b"
-					}
-					fixed := fixPath(unquoted)
-					diff.Meta = append(diff.Meta, line[:4]...)
-					diff.Meta = append(diff.Meta, []byte(quotePath(side+"/"+fixed))...)
-					diff.Meta = append(diff.Meta, '\n')
-				default:
-					diff.Meta = append(diff.Meta, line...)
-					diff.Meta = append(diff.Meta, '\n')
-				}
-			}
-			diff.Meta = bytes.TrimSuffix(diff.Meta, []byte{'\n'})
+			diff.Meta = rewriteDiffMeta(diff.Meta, fixPath)
 			diffs = append(diffs, diff)
-		} else if len(diff.Path) > len(r.prefix) && strings.EqualFold(diff.Path[:len(r.prefix)], r.prefix) {
+		} else if isCaseMismatch(diff.Path, r.prefix) {
 			// A case-insensitive host or a mistyped configuration would
 			// otherwise silently drop every diff of a renamed prefix.
 			log.Fatalf("diff path %s matches prefix %q only by letter case; fix the configured prefix", diff.Path, r.prefix)
@@ -698,6 +718,55 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 	}
 	patch.Diffs = diffs
 	return patch, nil
+}
+
+// rewriteDiffMeta rewrites the a/ and b/ pathnames inside a diff's
+// metadata section through fixPath, reproducing every other line
+// byte-for-byte — including per-line trailing carriage returns, which
+// must survive round trips even though they never participate in
+// prefix inspection. The result carries no trailing newline, matching
+// Diff.Meta's contract.
+func rewriteDiffMeta(meta []byte, fixPath func(string) string) []byte {
+	var out []byte
+	for meta != nil {
+		line := scanLine(&meta)
+		hasCR := bytes.HasSuffix(line, []byte{'\r'})
+		if hasCR {
+			line = line[:len(line)-1]
+		}
+		switch {
+		case bytes.HasPrefix(line, prefixA):
+			out = append(out, prefixA...)
+			out = append(out, fixPath(string(line[len(prefixA):]))...)
+		case bytes.HasPrefix(line, prefixB):
+			out = append(out, prefixB...)
+			out = append(out, fixPath(string(line[len(prefixB):]))...)
+		case bytes.HasPrefix(line, []byte(`--- "a/`)), bytes.HasPrefix(line, []byte(`+++ "b/`)):
+			// C-quoted form: `--- "a/P"` / `+++ "b/P"`. The escaped
+			// path is decoded, rewritten, and re-emitted in git's exact
+			// quoting grammar.
+			escaped := strings.TrimSuffix(string(line[7:]), `"`)
+			unquoted, err := strconv.Unquote(`"` + escaped + `"`)
+			if err != nil {
+				out = append(out, line...)
+				break
+			}
+			side := "a"
+			if bytes.HasPrefix(line, []byte("+++")) {
+				side = "b"
+			}
+			fixed := fixPath(unquoted)
+			out = append(out, line[:4]...)
+			out = append(out, []byte(quotePath(side+"/"+fixed))...)
+		default:
+			out = append(out, line...)
+		}
+		if hasCR {
+			out = append(out, '\r')
+		}
+		out = append(out, '\n')
+	}
+	return bytes.TrimSuffix(out, []byte{'\n'})
 }
 
 // Apply applies a patch to the repository.
@@ -722,13 +791,15 @@ func (r *Repo) Apply(patch Patch) error {
 
 // PatchIsEmpty reports whether the commit named by the provided digest
 // contains no file changes (--always format-patch emits headers even
-// for empty commits).
+// for empty commits). Output is requested NUL-delimited and tested at
+// raw length: pathnames may consist entirely of whitespace, so any
+// trimming of line-oriented output would erase a real change.
 func (r *Repo) PatchIsEmpty(id string) (bool, error) {
-	out, err := r.git(nil, "format-patch", "--always", "-1", id, "--stdout")
+	out, err := r.git(nil, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", "--root", id)
 	if err != nil {
 		return false, err
 	}
-	return !bytes.Contains(out, []byte("diff --git")), nil
+	return len(out) == 0, nil
 }
 
 // CommitEmptyWithMessageFile creates an empty commit whose message is
@@ -739,13 +810,15 @@ func (r *Repo) CommitEmptyWithMessageFile(relPath string) error {
 	return err
 }
 
-// ResetToRemote discards all local state in favor of the remote tip of
-// the configured branch. Used after a failed push: a non-fast-forward
-// rejection means the destination advanced independently, and any
-// locally applied commits were built on a stale base.
+// ResetToRemote discards all local state in favor of the remote tip as
+// of the most recent Open (the originHead snapshot; a third-party push
+// after Open is picked up by the next run). Used after a failed push: a
+// non-fast-forward rejection means the destination advanced
+// independently, and any locally applied commits were built on a stale
+// base.
 func (r *Repo) ResetToRemote() error {
 	_, _ = r.git(nil, "am", "--abort")
-	_, err := r.git(nil, "reset", "--hard", "FETCH_HEAD")
+	_, err := r.git(nil, "reset", "--hard", r.originHead)
 	return err
 }
 

@@ -662,7 +662,7 @@ func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
 	// Tag state is message-level; a prefix pathspec would silently empty
 	// the set whenever the prefix subtree is absent from the worktree,
 	// defeating exactly-once exclusion and degrading to full replays.
-	commits, err := dst.LogIgnoringPrefix()
+	commits, err := dst.LogIgnoringPrefix("--grep=shipit-source-id:")
 	if err != nil {
 		return nil, err
 	}
