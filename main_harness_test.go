@@ -1,19 +1,16 @@
-// Copyright 2018 GRAIL, Inc. All rights reserved.
-// Use of this source code is governed by the Apache 2.0
-// license that can be found in the LICENSE file.
-
 package main_test
 
 import (
 	"crypto/sha256"
 	"fmt"
-	gritgit "github.com/grailbio/grit/git"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	gritgit "github.com/grailbio/grit/git"
 )
 
 var regexpFullDigest = regexp.MustCompile(`fbshipit-source-id: [0-9a-f]{40}`)
@@ -44,12 +41,67 @@ func gritOutput(t *testing.T, bin, srcSpec, dstSpec string, extra ...string) str
 		"-push", srcSpec, dstSpec,
 	}
 	args = append(args, extra...)
-	cmd := exec.Command(bin, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := runGrit(bin, args)
 	if err != nil {
 		t.Logf("grit exited non-zero (expected when pausing):\n%s", out)
 	}
-	return string(out)
+	return out
+}
+
+// gritOutputStrict behaves like gritOutput but fails the test on any
+// non-zero grit exit: for call sites where a paused conflict session
+// is not an expected outcome.
+func gritOutputStrict(t *testing.T, bin, srcSpec, dstSpec string, extra ...string) string {
+	t.Helper()
+	args := []string{
+		"-config=user.name=test,user.email=" + testAuthorEnv,
+		"-push", srcSpec, dstSpec,
+	}
+	args = append(args, extra...)
+	out, err := runGrit(bin, args)
+	if err != nil {
+		t.Fatalf("grit %v exited %v:\n%s", args, err, out)
+	}
+	return out
+}
+
+func runGrit(bin string, args []string) (string, error) {
+	cmd := exec.Command(bin, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// TestGritOutputStrictRejectsFailure runs a child go-test whose canary
+// feeds the strict harness a non-zero-exiting binary; it must fail.
+func TestGritOutputStrictRejectsFailure(t *testing.T) {
+	if os.Getenv("GRIT_STRICT_CANARY") != "" {
+		bin := filepath.Join(t.TempDir(), "corrupt-grit")
+		if err := os.WriteFile(bin, []byte("#!/bin/sh\necho boom >&2\nexit 7\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		gritOutputStrict(t, bin, "src", "dst")
+		t.Log("strict harness unexpectedly tolerated the corruption")
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestGritStrictCanary", "-test.count=1")
+	cmd.Env = append(os.Environ(), "GRIT_STRICT_CANARY=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "exited") {
+		t.Fatalf("strict harness did not fail the corrupted invocation (err=%v):\n%s", err, out)
+	}
+}
+
+// TestGritStrictCanary exists solely for
+// TestGritOutputStrictRejectsFailure's child process.
+func TestGritStrictCanary(t *testing.T) {
+	if os.Getenv("GRIT_STRICT_CANARY") == "" {
+		t.Skip("canary for TestGritOutputStrictRejectsFailure")
+	}
+	bin := filepath.Join(t.TempDir(), "corrupt-grit")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho boom >&2\nexit 7\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gritOutputStrict(t, bin, "src", "dst")
 }
 
 // gritDumpOutput runs grit in -dump mode (no application, no push) and
@@ -90,9 +142,8 @@ func fileContains(t *testing.T, path, substr string) bool {
 	return strings.Contains(string(b), substr)
 }
 
-// TestGritCloneDirMatchesCachePath pins the test helper's clone-path
-// derivation against grit's own: drift between them would silently
-// mislocate paused sessions in every session-related test.
+// TestGritCloneDirMatchesCachePath pins the helper's clone-path derivation
+// against grit's own so session tests cannot silently mislocate clones.
 func TestGritCloneDirMatchesCachePath(t *testing.T) {
 	t.Setenv("TEST_TMPDIR", t.TempDir())
 	const url = "https://example.com/mirror.git"

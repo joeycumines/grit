@@ -7,13 +7,17 @@ import (
 	"bytes"
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/grailbio/testutil"
 )
@@ -267,6 +271,15 @@ func TestLFS(t *testing.T) {
 		defer cleanup()
 	}
 
+	// Reserve a kernel-assigned port so concurrent test runs cannot
+	// collide on a fixed lfs-test-server endpoint.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -278,6 +291,11 @@ func TestLFS(t *testing.T) {
 			"LFS_ADMINUSER=user",
 			"LFS_ADMINPASS=pass",
 			"LFS_CONTENTPATH=" + dir,
+			// LFS_LISTEN binds the listener; LFS_HOST is what the
+			// server embeds into the upload hrefs it hands back, and
+			// defaults to localhost:8080 without it.
+			"LFS_LISTEN=tcp://127.0.0.1:" + strconv.Itoa(port),
+			"LFS_HOST=127.0.0.1:" + strconv.Itoa(port),
 		}
 		err := cmd.Run()
 		if err != nil && err != context.Canceled && !strings.HasSuffix(err.Error(), "signal: killed") {
@@ -285,8 +303,9 @@ func TestLFS(t *testing.T) {
 		}
 		wg.Done()
 	}()
+	waitForListener(t, port)
 
-	shell(t, dir, `
+	shell(t, dir, fmt.Sprintf(`
 		mkdir repos
 
 		git init --bare repos/src
@@ -295,10 +314,10 @@ func TestLFS(t *testing.T) {
 		git config user.email you@example.com
 		git config user.name "your name"
 		git lfs install
-		git config -f .lfsconfig lfs.url http://user:pass@localhost:8080
+		git config -f .lfsconfig lfs.url http://user:pass@127.0.0.1:%d
+		git config lfs.url http://user:pass@127.0.0.1:%d
 		git add .lfsconfig
-		git commit -a -m "lfsconfig"
-
+		git commit -a -m "lfsconfig"`, port, port)+`
 		echo bigfile >bigfile
 		git lfs track bigfile
 		git add .
@@ -758,6 +777,58 @@ func TestPreservedTailRequiresRemoteAncestry(t *testing.T) {
 	}
 	if authored {
 		t.Fatal("unrelated history must not be preserved")
+	}
+}
+
+// TestParseCommitsMalformedHeader pins that a git-log stream carrying a
+// header line without a colon produces a wrapped error instead of an
+// index-out-of-range panic.
+func TestParseCommitsMalformedHeader(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git master
+		cd master
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo x > x.txt
+		git add .
+		git commit -qm one
+	`)
+	r := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "master"),
+		prefix: "", branch: "master"}
+
+	stream := []byte("commit 0123456789abcdef0123456789abcdef01234567\nnot-a-header-line\n\n    body\n")
+	if _, err := parseCommits(r, stream); err == nil {
+		t.Fatal("malformed commit header parsed without error")
+	} else if !strings.Contains(err.Error(), "malformed commit header") {
+		t.Fatalf("error %v does not identify the malformed header", err)
+	}
+}
+
+// waitForListener blocks until the TCP port accepts connections, so the
+// fixture's first LFS request never races the server's bind. An
+// initial refusal makes git-lfs fall back to its compiled-in default
+// endpoint, which silently targets the wrong server.
+func waitForListener(t *testing.T, port int) {
+	t.Helper()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			c.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lfs-test-server never listened on %s: %v", addr, err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

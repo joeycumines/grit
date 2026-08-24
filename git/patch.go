@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/mail"
 	"regexp"
 	"strconv"
@@ -269,7 +268,7 @@ func parsePatchHeader(b []byte) (Patch, error) {
 	if p.Subject == "" {
 		return Patch{}, errors.New("patch is missing subject")
 	}
-	b, err = ioutil.ReadAll(m.Body)
+	b, err = io.ReadAll(m.Body)
 	if err != nil {
 		return Patch{}, err
 	}
