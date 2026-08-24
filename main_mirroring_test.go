@@ -1,7 +1,3 @@
-// Copyright 2018 GRAIL, Inc. All rights reserved.
-// Use of this source code is governed by the Apache 2.0
-// license that can be found in the LICENSE file.
-
 package main_test
 
 import (
@@ -10,15 +6,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// TestDuplicateAddConvergence replicates the eventloop fuzz-testdata
-// collision: content arrives at the destination through a direct commit,
-// and a later source commit adds identical bytes. The duplicate diff must
-// be pruned (no conflict, no empty commit) while the rest of the commit
-// applies, and a rerun must reach a stable nothing-to-do fixed point.
+// TestDuplicateAddConvergence replicates the eventloop fuzz-testdata collision:
+// duplicate content prunes as converged while the rest applies to a fixed point.
 func TestDuplicateAddConvergence(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -50,8 +44,8 @@ func TestDuplicateAddConvergence(t *testing.T) {
 	dst.pull()
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 
-	// The applied commit carries the real change but — being partially
-	// pruned — deliberately no shipit tag, so it stays re-examinable.
+	// The applied commit carries the real change but, being partially
+	// pruned, deliberately no shipit tag, so it stays re-examinable.
 	tip := strings.TrimSpace(dst.gitOut("log", "-1", "--format=%B"))
 	if strings.Contains(tip, "fbshipit-source-id: ") {
 		t.Fatalf("partially-pruned commit was tagged: %q", tip)
@@ -67,12 +61,8 @@ func TestDuplicateAddConvergence(t *testing.T) {
 	}
 }
 
-// TestPartialDriftThreeWay verifies that a patch whose textual
-// context has drifted at the destination is rescued by three-way merge:
-// the destination edits line 5 — inside the hunk context of the source's
-// edit to lines 8-9 — so plain git am fails (verified against raw git),
-// while am --3way reconstructs the base tree from the patch's index
-// lines and merges both changes.
+// TestPartialDriftThreeWay verifies drifted context defeats plain git am while
+// am --3way rebuilds the base from index lines and merges both changes.
 func TestPartialDriftThreeWay(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -116,12 +106,8 @@ func TestPartialDriftThreeWay(t *testing.T) {
 	}
 }
 
-// TestTagSetExclusionExactlyOnce verifies that shipit-tag state makes
-// processing exactly-once across runs: after two sibling commits are
-// applied, a later incremental run re-selects the first sibling (it is
-// not an ancestor of the new anchor, which sits atop the second
-// sibling) but must exclude it by its recorded tag rather than replay
-// it. Also asserts that new tags record the full source digest.
+// TestTagSetExclusionExactlyOnce verifies a re-selected non-ancestor sibling is
+// excluded by its recorded tag, not replayed; new tags carry the full digest.
 func TestTagSetExclusionExactlyOnce(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -185,11 +171,8 @@ func TestTagSetExclusionExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestLegacyAbbreviatedAnchorSuppressesReplay verifies that a
-// destination commit carrying a legacy abbreviated (7-hex) shipit id
-// resolves as the resume anchor, bounding the selection range so its
-// source commit is not replayed. Prefix-matching of abbreviated ids
-// during tag-set exclusion is covered by TestIsProcessed.
+// TestLegacyAbbreviatedAnchorSuppressesReplay verifies a legacy 7-hex id still
+// anchors the walk so its source commit is not replayed (see TestIsProcessed).
 func TestLegacyAbbreviatedAnchorSuppressesReplay(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -225,10 +208,8 @@ func TestLegacyAbbreviatedAnchorSuppressesReplay(t *testing.T) {
 	}
 }
 
-// TestFullyConvergedCommitSkipped verifies the whole-commit skip path:
-// a source commit whose every diff already matches the destination
-// creates no destination commit, is reported in the skip accounting, and
-// leaves the repository at a stable nothing-to-do fixed point.
+// TestFullyConvergedCommitSkipped verifies the whole-commit skip path: a source
+// commit already matching the destination creates nothing and stays accounted.
 func TestFullyConvergedCommitSkipped(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -292,13 +273,9 @@ func TestFullyConvergedCommitSkipped(t *testing.T) {
 	}
 }
 
-// TestFullHistorySelectionSeesMergeHiddenCommits pins the defeat of
-// git's default history simplification: a side-branch commit whose
-// prefix effect duplicates the surviving merge parent's tree would be
-// hidden from a plain prefixed `git log A..B` (the same silent-skip
-// signature the selection fix exists to prevent). With --full-history
-// the commit must appear in the run — here as pruned-converged, since
-// its content landed through the mainline duplicate.
+// TestFullHistorySelectionSeesMergeHiddenCommits pins --full-history selection:
+// a side-branch commit duplicating its merge parent's prefix effect is invisible
+// to plain prefixed `git log A..B` yet must still be examined.
 func TestFullHistorySelectionSeesMergeHiddenCommits(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -329,9 +306,8 @@ func TestFullHistorySelectionSeesMergeHiddenCommits(t *testing.T) {
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 }
 
-// TestProseQuotedIdDoesNotDropCommit pins the own-line rule for the
-// copy filter: a source commit whose message merely quotes a shipit id
-// mid-prose must still be mirrored, changes and all.
+// TestProseQuotedIdDoesNotDropCommit pins the own-line rule: a source commit
+// merely quoting a shipit id mid-prose is still mirrored, changes and all.
 func TestProseQuotedIdDoesNotDropCommit(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -368,10 +344,8 @@ func (r *gritRepo) writeSymlink(path, target string) {
 	}
 }
 
-// TestSymlinkConvergenceAndDeletion covers BlobHash's link-text
-// hashing end to end: an identically re-added symlink is pruned as
-// converged (hashing through the target would never match), and a
-// broken symlink's deletion applies instead of being falsely pruned.
+// TestSymlinkConvergenceAndDeletion covers BlobHash's link-text hashing end to
+// end: identical re-added symlinks prune as converged; deletions still apply.
 func TestSymlinkConvergenceAndDeletion(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("creating symlinks on windows requires privileges")
@@ -424,10 +398,8 @@ func TestSymlinkConvergenceAndDeletion(t *testing.T) {
 	}
 }
 
-// TestModeFlipIsNotConverged pins that convergence pruning compares
-// modes as well as content: identical bytes with a pending exec-bit flip
-// must apply, leaving the destination executable — not silently pruned
-// into permanent divergence.
+// TestModeFlipIsNotConverged pins that convergence compares modes as well as
+// bytes: a pending exec-bit flip must apply, not prune into divergence.
 func TestModeFlipIsNotConverged(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("executable bits are not representable when core.filemode=false")
@@ -486,11 +458,8 @@ func TestModeFlipIsNotConverged(t *testing.T) {
 	}
 }
 
-// TestRewrittenPathNeverPruned pins that convergence pruning is
-// disabled for rewrite-rule paths: the recorded post-image is pre-rewrite,
-// so blob equality would silently freeze un-rewritten content into the
-// destination. With the rule active, raw upstream content must be
-// rewritten on application.
+// TestRewrittenPathNeverPruned pins that rewrite-rule paths never converge-prune:
+// the recorded post-image is pre-rewrite, so equality would freeze raw content.
 func TestRewrittenPathNeverPruned(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -505,7 +474,7 @@ func TestRewrittenPathNeverPruned(t *testing.T) {
 	dst.pull()
 
 	// Raw upstream form arrives at the destination through a direct
-	// commit — exactly what a rewrite rule exists to translate.
+	// commit, the exact input a rewrite rule exists to translate.
 	dst.write("f.txt", "RAWVALUE\n")
 	dst.commit("destination receives raw form")
 	dst.push()
@@ -544,11 +513,9 @@ func TestRewrittenPathNeverPruned(t *testing.T) {
 	}
 }
 
-// TestUntrackedLeftoverDoesNotSilenceAddition pins that convergence
-// pruning consults HEAD's committed tree, never the worktree: an
-// untracked leftover identical to an incoming addition cannot silence
-// it. The collision fails loudly at application time; after cleaning
-// the leftover, the same run converges.
+// TestUntrackedLeftoverDoesNotSilenceAddition pins that convergence consults
+// HEAD's committed tree, never the worktree: untracked leftovers cannot silence
+// an incoming addition; the collision fails loudly at apply time.
 func TestUntrackedLeftoverDoesNotSilenceAddition(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -561,7 +528,7 @@ func TestUntrackedLeftoverDoesNotSilenceAddition(t *testing.T) {
 	src.gritSync(dst, "-push", srcSpec, dstSpec)
 	dst.pull()
 
-	// Untracked leftover inside grit's own destination clone — exactly
+	// Untracked leftover inside grit's own destination clone, exactly
 	// where grit's pause guidance tells users to edit.
 	payload := "payload\n"
 	clone := gritCloneDir(t, dst.bare, "", testBranch)
@@ -609,11 +576,8 @@ func TestUntrackedLeftoverDoesNotSilenceAddition(t *testing.T) {
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 }
 
-// TestAllTagsIneligibleIsFixedPoint pins that a destination whose
-// every tagged commit becomes anchor-ineligible under newly tightened
-// strip rules falls through to initial sync, where tag-set exclusion
-// drops the already-mirrored commits — a clean fixed point with the
-// exclusion actively engaged, not an error.
+// TestAllTagsIneligibleIsFixedPoint pins that an all-anchor-ineligible tag set
+// falls through to initial sync into a clean fixed point, not an error.
 func TestAllTagsIneligibleIsFixedPoint(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -641,11 +605,8 @@ func TestAllTagsIneligibleIsFixedPoint(t *testing.T) {
 	}
 }
 
-// TestPartiallyPrunedCommitReexamined pins the lifecycle of a commit
-// whose diffs partially converge: it lands without a shipit tag, its
-// kept change applies, an unchanged rerun is a quiet fixed point, and —
-// critically — if the destination later loses the applied half, the
-// re-examination restores it instead of freezing forever.
+// TestPartiallyPrunedCommitReexamined pins that a partially converged commit
+// lands untagged and is restored by re-examination if the destination loses it.
 func TestPartiallyPrunedCommitReexamined(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -685,7 +646,7 @@ func TestPartiallyPrunedCommitReexamined(t *testing.T) {
 
 	// The destination loses the applied half via a pure revert;
 	// re-examination must then restore it without noise. (A divergent
-	// rewrite would surface as a resolvable conflict instead — same
+	// rewrite would surface as a resolvable conflict instead, the same
 	// lifecycle as TestSessionPauseResume.)
 	dst.write("a.txt", "A1\n")
 	dst.commit("destination reverts the applied half")
@@ -700,10 +661,8 @@ func TestPartiallyPrunedCommitReexamined(t *testing.T) {
 	}
 }
 
-// TestStripMessagePartialStaysUntagged pins that strip-message rules
-// cannot re-tag a partially-pruned commit: the surviving half applies,
-// the commit lands untagged (re-examinable), and the stripped-subject
-// override is reserved for fully-tagged commits.
+// TestStripMessagePartialStaysUntagged pins that strip-message rules cannot
+// re-tag a partially-pruned commit: it lands untagged and stays re-examinable.
 func TestStripMessagePartialStaysUntagged(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -746,11 +705,8 @@ func TestStripMessagePartialStaysUntagged(t *testing.T) {
 	}
 }
 
-// TestGritStripCommitRuleGatesSelection proves that the strip-commit
-// rule gates SELECTION rather than application: a source commit named
-// by the rule never reaches the destination during initial sync, stays
-// excluded deterministically on reruns while it remains in the resume
-// range, and is picked up as soon as the rule is removed.
+// TestGritStripCommitRuleGatesSelection proves the strip-commit rule gates
+// SELECTION, not application: ruled-out commits never land until removal.
 func TestGritStripCommitRuleGatesSelection(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -797,5 +753,51 @@ func TestGritStripCommitRuleGatesSelection(t *testing.T) {
 	}
 	if got := dst.shipitCount(); got != 2 {
 		t.Fatalf("destination carries %d tagged commits after the rule removal, want 2", got)
+	}
+}
+
+// TestGritWarnsForNeverExistentPrefix proves a correctly-spelled never-existent
+// prefix warns loudly once per run while exiting cleanly.
+func TestGritWarnsForNeverExistentPrefix(t *testing.T) {
+	src, dst := setupGritRepos(t)
+	src.write("proj/f.txt", "real content")
+	src.commit("real module")
+	src.push()
+
+	typoSpec := src.bare + ",projx/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	out := gritOutputStrict(t, src.gritBin, typoSpec, dstSpec)
+	const marker = "does not exist anywhere in the source history"
+	if n := strings.Count(out, marker); n != 1 {
+		t.Fatalf("warning fired %d times, want exactly once:\n%s", n, out)
+	}
+	// Assert the quoted form: only the explicit %q naming renders the
+	// prefix with quotes, so this binds the warning itself rather than
+	// the source spec that precedes it on the same line.
+	if !strings.Contains(out, strconv.Quote("projx/")) {
+		t.Fatalf("warning does not name the offending prefix:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("warning must be non-fatal:\n%s", out)
+	}
+}
+
+// TestGritEmptyModuleStaysWarningFree proves the warning is scoped to prefixes
+// that never appeared anywhere: a historically nonempty module stays silent.
+func TestGritEmptyModuleStaysWarningFree(t *testing.T) {
+	src, dst := setupGritRepos(t)
+	src.write("proj/.keep", "")
+	src.commit("placeholder module")
+	src.push()
+
+	spec := src.bare + ",proj/," + testBranch
+	out := gritOutputStrict(t, src.gritBin, spec, dst.bare+",,"+testBranch)
+	const marker = "does not exist anywhere in the source history"
+	if strings.Contains(out, marker) {
+		t.Fatalf("historically-existing module was warned about:\n%s", out)
+	}
+	if !strings.Contains(out, "applying") {
+		t.Fatalf("placeholder module did not sync:\n%s", out)
 	}
 }
