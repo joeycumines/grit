@@ -127,8 +127,9 @@
 //	# Pull changes from repoB to repoA. But don't push it automatically, since we want to
 //	# review them internally.
 //	grit $repoB $repoA
-//	# grailXXXXX is the copy of repoA managed by grit
-//	cd /var/tmp/grit/grailXXXXX
+//	# grailXXXXX is the copy of repoA managed by grit, under the clone
+//	# cache root (the OS temporary directory by default; see README).
+//	cd /tmp/grit/grailXXXXX
 //	# Squash changes into one
 //	git reset --soft origin/master && git commit --edit -m"$(git log --reverse HEAD..HEAD@{1})"
 //	# Start a regular code review process.
@@ -222,6 +223,12 @@ func main() {
 			log.Fatalf("invalid rule type %s", parts[0])
 		}
 	}
+
+	// Bound clone cache growth before any repository opens: stale
+	// entries are removed here, and entries this run goes on to open
+	// were either fresh enough to survive the sweep or are rebuilt in
+	// place. Held locks make concurrent operators mutually invisible.
+	git.SweepCache()
 
 	log.Printf("synchronizing repo:%s prefix:%s branch:%s -> repo:%s prefix:%s branch:%s",
 		srcURL, srcPrefix, srcBranch, dstURL, dstPrefix, dstBranch)
