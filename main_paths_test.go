@@ -1,21 +1,14 @@
-// Copyright 2018 GRAIL, Inc. All rights reserved.
-// Use of this source code is governed by the Apache 2.0
-// license that can be found in the LICENSE file.
-
 package main_test
 
 import (
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// TestUnslashedPrefixDoesNotCaptureBoundarySiblings pins directory-
-// boundary containment for prefixes written without a trailing slash:
-// a diff for "project.txt" shares a string prefix with "proj" but lies
-// outside its scope. Bare HasPrefix containment mangled such paths via
-// TrimPrefix into phantom destination files; they must be dropped as
-// out-of-scope while genuine proj/ content still syncs.
+// TestUnslashedPrefixDoesNotCaptureBoundarySiblings pins directory-boundary
+// containment: bare HasPrefix mangles sibling "project.txt" into a phantom file.
 func TestUnslashedPrefixDoesNotCaptureBoundarySiblings(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -45,12 +38,8 @@ func TestUnslashedPrefixDoesNotCaptureBoundarySiblings(t *testing.T) {
 	}
 }
 
-// TestCaseOnlyRenameIsNotPruned pins case-sensitive path resolution in
-// convergence pruning: on case-insensitive filesystems, a case-only
-// rename serializes as delete+add, and the add half must not be pruned
-// just because the OS resolves it to the differently-cased existing
-// file. Without exact-name matching, the destination silently loses the
-// file.
+// TestCaseOnlyRenameIsNotPruned pins case-sensitive convergence pruning: a
+// case-only rename serializes as delete+add and must apply despite OS folding.
 func TestCaseOnlyRenameIsNotPruned(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -83,11 +72,8 @@ func TestCaseOnlyRenameIsNotPruned(t *testing.T) {
 	}
 }
 
-// TestCaseOnlySubdirRenameIsNotPruned pins case sensitivity for
-// intermediate path components: a case-only SUBDIRECTORY rename arrives
-// as delete+add, and on a case-insensitive host the add half resolves
-// through the still-existing old-case directory. Pruning it would
-// silently drop the file; it must be applied instead.
+// TestCaseOnlySubdirRenameIsNotPruned pins intermediate-component case
+// sensitivity: a case-only SUBDIRECTORY rename must apply, not prune.
 func TestCaseOnlySubdirRenameIsNotPruned(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -118,9 +104,8 @@ func TestCaseOnlySubdirRenameIsNotPruned(t *testing.T) {
 	}
 }
 
-// TestCaseMismatchedPrefixAborts pins that a configured prefix whose
-// letter case does not match the repository's paths aborts loudly
-// instead of silently dropping every diff on case-insensitive hosts.
+// TestCaseMismatchedPrefixAborts pins that a case-mismatched configured prefix
+// aborts loudly instead of silently dropping every diff on case-insensitive hosts.
 func TestCaseMismatchedPrefixAborts(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -132,15 +117,16 @@ func TestCaseMismatchedPrefixAborts(t *testing.T) {
 	src.push()
 
 	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
-	if !strings.Contains(out, "letter case") {
+	// Assert the CheckPrefixCasing-specific fragment: the generic
+	// "letter case" wording is shared with the deeper Patch-side fatal,
+	// so only this fragment proves the configuration guard fired.
+	if !strings.Contains(out, "does not match the repository") {
 		t.Fatalf("case-mismatched prefix did not abort loudly:\n%s", out)
 	}
 }
 
-// TestPathsContainingSpaces pins diff-header parsing for paths with
-// spaces: modern git emits symmetric unquoted headers, and a header
-// truncated at the first space used to wedge every subsequent run. The
-// addition must apply, and an identical re-add must prune as converged.
+// TestPathsContainingSpaces pins spaced-path header parsing: modern git emits
+// symmetric unquoted headers, and first-space truncation used to wedge runs.
 func TestPathsContainingSpaces(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -165,7 +151,7 @@ func TestPathsContainingSpaces(t *testing.T) {
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 
 	// An identical file arriving at the destination through a direct
-	// commit while the source also adds it must prune as converged —
+	// commit while the source also adds it must prune as converged,
 	// proving the spaced path survives parsing end to end.
 	dst.write("sp 2.txt", "second\n")
 	dst.commit("destination adds spaced file directly")
@@ -179,10 +165,8 @@ func TestPathsContainingSpaces(t *testing.T) {
 	}
 }
 
-// TestQuotedPathRoundTrip covers paths git C-quotes in diff headers
-// (non-ASCII bytes): the addition must apply through grit's quoted
-// parsing and emission, and an identical arrival at the destination
-// must prune as converged.
+// TestQuotedPathRoundTrip covers C-quoted diff-header paths (non-ASCII bytes):
+// quoted parsing applies additions, and identical destination arrivals prune.
 func TestQuotedPathRoundTrip(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -208,7 +192,7 @@ func TestQuotedPathRoundTrip(t *testing.T) {
 
 	// An identical non-ASCII path arriving at the destination through a
 	// direct commit while the source also adds it must prune as
-	// converged — proving quoted paths survive parsing end to end.
+	// converged, proving quoted paths survive parsing end to end.
 	dst.write("caf\u00e92.txt", "second\n")
 	dst.commit("destination receives identical non-ascii file directly")
 	dst.push()
@@ -221,9 +205,8 @@ func TestQuotedPathRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCaseMismatchedPrefixComponentAborts covers multi-component
-// prefixes: a wrong-cased intermediate component must abort loudly even
-// though tree-level pathspecs would silently select nothing.
+// TestCaseMismatchedPrefixComponentAborts covers multi-component prefixes: a
+// wrong-cased intermediate component must abort, not silently select nothing.
 func TestCaseMismatchedPrefixComponentAborts(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -235,15 +218,15 @@ func TestCaseMismatchedPrefixComponentAborts(t *testing.T) {
 	src.push()
 
 	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
-	if !strings.Contains(out, "only by letter case") {
+	// CheckPrefixCasing-specific fragment: proves the configuration
+	// guard (not the deeper Patch-side fatal) rejected this spec.
+	if !strings.Contains(out, "does not match the repository") {
 		t.Fatalf("multi-component case mismatch did not abort:\n%s", out)
 	}
 }
 
-// TestNonASCIIPrefixComponentCasing pins CheckPrefixCasing against
-// core.quotePath escaping: a correctly spelled non-ASCII prefix
-// component must be recognized (sync proceeds), and its case-typo must
-// abort loudly.
+// TestNonASCIIPrefixComponentCasing pins CheckPrefixCasing against core.quotePath
+// escaping: a correct non-ASCII component syncs; its case-typo aborts loudly.
 func TestNonASCIIPrefixComponentCasing(t *testing.T) {
 	for _, tc := range []struct {
 		prefix    string
@@ -269,5 +252,50 @@ func TestNonASCIIPrefixComponentCasing(t *testing.T) {
 		if !tc.wantAbort && aborted {
 			t.Fatalf("prefix %q: correct spelling was rejected:\n%s", tc.prefix, out)
 		}
+	}
+}
+
+// TestPatchSideLetterCaseFatal pins the deeper Patch-side guard: a case-typo'd
+// subdirectory added after an initial sync hits the diff-path fatal.
+func TestPatchSideLetterCaseFatal(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
+
+	// One commit touches base.txt and adds a case-typo'd subdirectory: the
+	// pathspec selects it, format-patch surfaces both diffs to Patch, and the
+	// typo hits the letter-case fatal (CheckPrefixCasing already passed).
+	//
+	// Index plumbing stages the typo because a case-insensitive filesystem
+	// would fold a worktree write into the existing lowercase directory.
+	src.write("proj/base.txt", "v2")
+	gitIn := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = src.dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	blob := strings.TrimSpace(gitIn("hash-object", "-w", "--stdin"))
+	gitIn("update-index", "--add", "--cacheinfo", "100644,"+blob+",PROJ/g.txt")
+	runGit(t, src.dir, "add", "proj/base.txt")
+	runGit(t, src.dir, "commit", "-m", "case-typo'd subdir alongside in-prefix change")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "only by letter case") {
+		t.Fatalf("patch-side case fatal did not fire:\n%s", out)
+	}
+	if strings.Contains(out, "does not match the repository") {
+		t.Fatalf("configuration guard fired instead of the patch-side guard:\n%s", out)
 	}
 }
