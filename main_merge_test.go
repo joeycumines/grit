@@ -328,6 +328,9 @@ func TestGritBidirectionalMergeStability(t *testing.T) {
 	if !strings.Contains(out, "nothing to do") {
 		t.Fatalf("second forward leg did not reach a fixed point:\n%s", out)
 	}
+	if strings.Contains(out, "pushing changes") {
+		t.Fatalf("fixed-point run attempted a push:\n%s", out)
+	}
 	if got := dst.shipitCount(); got != shipitsAfterForward {
 		t.Fatalf("ping-pong changed the destination's tagged-commit count from %d to %d", shipitsAfterForward, got)
 	}
@@ -453,4 +456,62 @@ func TestGritForeignEditOnMergedPathPausesThenConverges(t *testing.T) {
 		t.Fatalf("post-resolution convergence f.txt = %q, want %q", got, "holyhand")
 	}
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+}
+
+// TestGritBidirectionalFixedPoint runs the full ping-pong gauntlet over
+// a plain (merge-free) history: forward sync, reverse sync, and a third
+// forward leg that must be a true fixed point - "nothing to do" with no
+// push attempt and no application - leaving both bare remotes holding
+// identical trees.
+func TestGritBidirectionalFixedPoint(t *testing.T) {
+	src, dst := setupGritRepos(t)
+	forwardSrc := src.bare + ",proj/," + testBranch
+	forwardDst := dst.bare + ",," + testBranch
+
+	src.write("proj/one.txt", "1")
+	src.commit("first")
+	src.write("proj/two.txt", "2")
+	src.commit("second")
+	src.write("proj/three.txt", "3")
+	src.commit("third")
+	src.push()
+
+	gritOutputStrict(t, src.gritBin, forwardSrc, forwardDst)
+
+	reverseSrc := dst.bare + ",," + testBranch
+	reverseDst := src.bare + ",proj/," + testBranch
+	out := gritOutputStrict(t, src.gritBin, reverseSrc, reverseDst)
+	if strings.Contains(out, "applying") {
+		t.Fatalf("reverse leg applied commits the destination already accounted for:\n%s", out)
+	}
+
+	out = gritOutputStrict(t, src.gritBin, forwardSrc, forwardDst)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("third leg did not reach a fixed point:\n%s", out)
+	}
+	if strings.Contains(out, "pushing changes") {
+		t.Fatalf("fixed-point run attempted a push:\n%s", out)
+	}
+	if strings.Contains(out, "applying") {
+		t.Fatalf("fixed-point run applied commits:\n%s", out)
+	}
+
+	bareTree := func(bare, rev string) string {
+		t.Helper()
+		out, err := exec.Command("git", "-C", bare,
+			"rev-parse", rev).CombinedOutput()
+		if err != nil {
+			t.Fatalf("rev-parse %s in %s: %v\n%s", rev, bare, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	// The destination mirrors the source's proj/ subtree at its root.
+	srcTree := bareTree(src.bare, testBranch+":proj")
+	dstTree := bareTree(dst.bare, testBranch+"^{tree}")
+	if srcTree != dstTree {
+		srcRaw, _ := exec.Command("git", "-C", src.bare, "cat-file", "-p", srcTree).CombinedOutput()
+		dstRaw, _ := exec.Command("git", "-C", dst.bare, "cat-file", "-p", dstTree).CombinedOutput()
+		t.Fatalf("bare remotes diverged: src %s:proj=%s dst main^tree=%s\nsrc raw:\n%s\ndst raw:\n%s",
+			testBranch, srcTree, dstTree, srcRaw, dstRaw)
+	}
 }
