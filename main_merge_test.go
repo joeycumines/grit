@@ -10,13 +10,10 @@ import (
 	"testing"
 )
 
-// This file verifies that grit replicates merge-commit content, not
-// merely the commits on either side of a merge. Each merge is
-// reconciled at its topological position: its net effect becomes an
-// ordinary corrective patch tagged with the merge's own digest, so
-// hand-resolved ("evil") content, "-s ours" discards, and octopus
-// unions replicate byte-exactly, exactly once, and in both directions,
-// while trivial merges replicate nothing at all.
+// This file verifies that grit replicates merge-commit content: each merge
+// is reconciled at its topological position into an ordinary corrective patch
+// tagged with the merge's own digest, so evil resolutions, "-s ours" discards,
+// and octopus unions replicate byte-exactly, once, in both directions.
 
 // syncEvilHistory builds and synchronizes a history whose final merge
 // hand-resolves proj/f.txt to "holyhand" beyond either parent's state,
@@ -50,9 +47,8 @@ func syncEvilHistory(t *testing.T, src, dst *gritRepo, srcSpec, dstSpec string) 
 	return mHex
 }
 
-// TestGritEvilMergeReplicatesByteExact proves that a merge's bespoke
-// conflict resolution lands at the destination byte-for-byte, tagged
-// with the merge's own digest, and that an immediate rerun is a no-op.
+// TestGritEvilMergeReplicatesByteExact proves an evil merge lands byte-exact,
+// tagged with its own digest, and an immediate rerun is a no-op.
 func TestGritEvilMergeReplicatesByteExact(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -80,9 +76,8 @@ func TestGritEvilMergeReplicatesByteExact(t *testing.T) {
 	}
 }
 
-// TestGritOursDiscardReplicatesAndStaysDiscarded proves that an
-// "-s ours" merge replicates as a revert of the replayed side content,
-// and that later forward runs never resurrect the discarded branch.
+// TestGritOursDiscardReplicatesAndStaysDiscarded proves an "-s ours" merge
+// replicates as a side-content revert and is never resurrected later.
 func TestGritOursDiscardReplicatesAndStaysDiscarded(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -123,9 +118,8 @@ func TestGritOursDiscardReplicatesAndStaysDiscarded(t *testing.T) {
 	}
 }
 
-// TestGritTrivialMergeFree proves that a merge whose result equals the
-// state built up by applying its ancestors adds zero extra destination
-// commits and takes no tag.
+// TestGritTrivialMergeFree proves a merge matching its ancestors' state adds
+// zero destination commits and takes no tag.
 func TestGritTrivialMergeFree(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -297,10 +291,8 @@ func TestGritBinaryEvilMergeRoundTrips(t *testing.T) {
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 }
 
-// TestGritBidirectionalMergeStability runs the ping-pong gauntlet over
-// a merge-carrying history: forward, reverse, and forward again must
-// leave both remotes holding identical trees with no duplicated or
-// drifted merge content.
+// TestGritBidirectionalMergeStability runs forward-reverse-forward over a
+// merge-carrying history; both remotes must hold identical trees throughout.
 func TestGritBidirectionalMergeStability(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	forwardSrc := src.bare + ",proj/," + testBranch
@@ -341,12 +333,8 @@ func TestGritBidirectionalMergeStability(t *testing.T) {
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 }
 
-// TestGritMergeRespectsStripRules proves that path rules gate merge
-// replication exactly as they gate regular commits: a merge whose tree
-// touches a stripped file must not smuggle that content into the
-// destination, the surviving changes still replicate, and the
-// partially-stripped corrective lands without a shipit tag so it
-// remains re-examinable.
+// TestGritMergeRespectsStripRules proves strip rules gate merge content like
+// regular commits: no smuggling, survivors replicate, corrective untagged.
 func TestGritMergeRespectsStripRules(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -397,14 +385,8 @@ func TestGritMergeRespectsStripRules(t *testing.T) {
 	}
 }
 
-// TestGritForeignEditOnMergedPathPausesThenConverges proves that a
-// third-party destination edit on a merged path pauses the run loudly
-// with a resolvable session, and that resolving it lets the run finish
-// through the merge to byte-exact convergence. The pause fires when the
-// merge's ancestor commit applies against the foreign edit; the merge's
-// own reconciliation never conflicts, because its corrective patch is
-// derived against the destination tree as it stands, so a path touched
-// only by reconciliation converges without pausing.
+// TestGritForeignEditOnMergedPathPausesThenConverges proves a foreign edit on
+// a merged path pauses loudly, then converges byte-exact after resolution.
 func TestGritForeignEditOnMergedPathPausesThenConverges(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	srcSpec := src.bare + ",proj/," + testBranch
@@ -458,11 +440,8 @@ func TestGritForeignEditOnMergedPathPausesThenConverges(t *testing.T) {
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 }
 
-// TestGritBidirectionalFixedPoint runs the full ping-pong gauntlet over
-// a plain (merge-free) history: forward sync, reverse sync, and a third
-// forward leg that must be a true fixed point - "nothing to do" with no
-// push attempt and no application - leaving both bare remotes holding
-// identical trees.
+// TestGritBidirectionalFixedPoint: after forward-reverse-forward over plain
+// history, the last leg is a true fixed point leaving identical remote trees.
 func TestGritBidirectionalFixedPoint(t *testing.T) {
 	src, dst := setupGritRepos(t)
 	forwardSrc := src.bare + ",proj/," + testBranch
@@ -513,5 +492,62 @@ func TestGritBidirectionalFixedPoint(t *testing.T) {
 		dstRaw, _ := exec.Command("git", "-C", dst.bare, "cat-file", "-p", dstTree).CombinedOutput()
 		t.Fatalf("bare remotes diverged: src %s:proj=%s dst main^tree=%s\nsrc raw:\n%s\ndst raw:\n%s",
 			testBranch, srcTree, dstTree, srcRaw, dstRaw)
+	}
+}
+
+// TestGritIndentedQuoteIsNotAnAnchor pins that only grit's flush-left tags
+// anchor the resume walk; quoted digests fall to the tolerant exclusion set.
+func TestGritIndentedQuoteIsNotAnAnchor(t *testing.T) {
+	src, dst := setupGritRepos(t)
+	forwardSrc := src.bare + ",proj/," + testBranch
+	forwardDst := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "base")
+	src.commit("base")
+	src.push()
+	gritOutputStrict(t, src.gritBin, forwardSrc, forwardDst)
+
+	// Two unsynced source commits: U lands before S, so a tolerant walk
+	// bound at U's digest would permanently skip U.
+	src.write("proj/u.txt", "u")
+	src.commit("unsynced older")
+	uHex := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+	src.write("proj/s.txt", "s")
+	src.commit("unsynced newer")
+	src.push()
+
+	// A foreign commit atop the synced base quotes U's digest (uHex)
+	// on an indented line and carries the convergence marker so the
+	// preservation gate accepts it as grit-authored state.
+	foreign, cleanup := foreignClone(t, dst.bare)
+	defer cleanup()
+	writeFile(t, filepath.Join(foreign, "q.txt"), "q")
+	runGit(t, foreign, "add", "-A")
+	runGitConfigured(t, foreign, "commit", "-m", "quoted anchor",
+		"-m", "    fbshipit-source-id: "+uHex,
+		"-m", "grit-convergence-pruned: 1/1")
+	runGitConfigured(t, foreign, "push", "origin", "HEAD:"+testBranch)
+
+	out := gritOutputStrict(t, src.gritBin, forwardSrc, forwardDst)
+	// THE WALK FIX, pinned: the selection range must span back to the
+	// genuine base anchor (2 commits) rather than stopping at the
+	// quoted digest (which yielded "1 commits to copy" under the old
+	// ^\s*-tolerant walk).
+	if !strings.Contains(out, "2 commits to copy") {
+		t.Fatalf("indented quotation bounded the resume range:\n%s", out)
+	}
+	// Deliberately tolerant tag-exclusion (a documented residual
+	// ambiguity shared with the anchor's historic tolerance) then drops
+	// U because Q quotes its digest; S still replicates. Re-tightening
+	// the exclusion set is outside this change's scope.
+	if !strings.Contains(out, "skipping already synchronized "+uHex[:7]) {
+		t.Fatalf("quoted digest was not recognized by tag exclusion:\n%s", out)
+	}
+	dst.pull()
+	if got := dstRead(t, dst.dir, "s.txt"); got != "s" {
+		t.Fatalf("commit newer than the quoted digest did not land: s.txt = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dst.dir, "u.txt")); !os.IsNotExist(err) {
+		t.Fatalf("tag-excluded commit unexpectedly landed: %v", err)
 	}
 }

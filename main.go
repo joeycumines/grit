@@ -334,7 +334,13 @@ func main() {
 	for head := "HEAD"; ; {
 		// The anchor is message-level state: it must be found even when
 		// the destination prefix subtree is absent from the worktree.
-		last, err := dst.LogIgnoringPrefix("-1", "--grep", `^\s*\(fb\)\?shipit-source-id: [a-z0-9]\+$`, head)
+		// The anchor must be grit's own flush-left serialization:
+		// Patch.Write appends the tag as the final, unindented body
+		// line. A tolerant ^\s* here would let a Log-dedented (or
+		// author-indented) quotation of a source digest inside a commit
+		// message act as the resume anchor and permanently bound the
+		// range past unsynced commits.
+		last, err := dst.LogIgnoringPrefix("-1", "--grep", `^\(fb\)\?shipit-source-id: [a-z0-9]\+$`, head)
 		if err != nil {
 			log.Fatalf("log %s: %v", dst, err)
 		}
