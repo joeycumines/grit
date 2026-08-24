@@ -745,3 +745,57 @@ func TestStripMessagePartialStaysUntagged(t *testing.T) {
 		t.Fatalf("surviving half did not land: %q", got)
 	}
 }
+
+// TestGritStripCommitRuleGatesSelection proves that the strip-commit
+// rule gates SELECTION rather than application: a source commit named
+// by the rule never reaches the destination during initial sync, stays
+// excluded deterministically on reruns while it remains in the resume
+// range, and is picked up as soon as the rule is removed.
+func TestGritStripCommitRuleGatesSelection(t *testing.T) {
+	src, dst := setupGritRepos(t)
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/keep.txt", "keep")
+	src.commit("kept commit")
+	src.write("proj/doomed.txt", "doomed")
+	src.commit("doomed commit")
+	doomedHex := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+	src.push()
+
+	rule := "strip-commit:" + doomedHex[:8]
+	out := gritOutputStrict(t, src.gritBin, srcSpec, dstSpec, rule)
+	if !strings.Contains(out, "1 commits to copy") {
+		t.Fatalf("commit accounting did not reflect the strip-commit exclusion:\n%s", out)
+	}
+	dst.pull()
+	if got := dstRead(t, dst.dir, "keep.txt"); got != "keep" {
+		t.Fatalf("sibling commit did not land: keep.txt = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dst.dir, "doomed.txt")); !os.IsNotExist(err) {
+		t.Fatalf("strip-commit-designated commit reached the destination")
+	}
+	if got := dst.shipitCount(); got != 1 {
+		t.Fatalf("destination carries %d tagged commits, want exactly the sibling's 1", got)
+	}
+
+	out = gritOutputStrict(t, src.gritBin, srcSpec, dstSpec, rule)
+	if !strings.Contains(out, "0 commits to copy") {
+		t.Fatalf("rerun did not exclude the stripped commit deterministically:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("rerun with the rule did not reach a fixed point:\n%s", out)
+	}
+
+	out = gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "nothing to do") && !strings.Contains(out, "applying") {
+		t.Fatalf("removing the rule did not resume copying of the excluded commit:\n%s", out)
+	}
+	dst.pull()
+	if got := dstRead(t, dst.dir, "doomed.txt"); got != "doomed" {
+		t.Fatalf("excluded commit did not land after the rule was removed: doomed.txt = %q", got)
+	}
+	if got := dst.shipitCount(); got != 2 {
+		t.Fatalf("destination carries %d tagged commits after the rule removal, want 2", got)
+	}
+}
