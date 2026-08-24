@@ -48,13 +48,13 @@
 //
 // # Linearization
 //
-// If the flag -linearize is provided, then the source repository's
-// history is linearized before copying commits. Linearization is
-// done by ensuring that every commit has a single parent, so that
-// the repository contains no merge commits. This is useful to ensure
-// that grit can cleanly apply patches from repositories whose
-// histories are not linear (e.g., when accepting patches from
-// GitHub).
+// If the flag -linearize is provided, grit rewrites the cached clone
+// of the source repository into a single-parent history before
+// copying commits, so that every change arrives as an ordinary patch
+// even when the upstream history branches and merges. The rewrite is
+// recomputed from the remote at the start of each run, applied only
+// to the cached clone, and never pushed: the source repository itself
+// is left untouched.
 //
 // # Incremental synchronization
 //
@@ -162,7 +162,7 @@ func main() {
 	dump := flag.Bool("dump", false, "dump patches to stdout instead of applying them to the destination repository")
 	push := flag.Bool("push", false, "push applied changes to the destination repository's remote")
 	configs := flag.String("config", "", "comma-separated key-value pairs that should be passed to git")
-	linearize := flag.Bool("linearize", false, "linearize source repository history before copying commits")
+	linearize := flag.Bool("linearize", false, "rewrite the cached source clone to a single-parent history before copying commits; the source repository is left untouched")
 	flag.Usage = usage
 	flag.Parse()
 	if flag.NArg() < 2 {
