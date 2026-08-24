@@ -174,8 +174,14 @@ func main() {
 	if *push && *dump {
 		flag.Usage()
 	}
-	srcURL, srcPrefix, srcBranch := parseSpec(flag.Arg(0))
-	dstURL, dstPrefix, dstBranch := parseSpec(flag.Arg(1))
+	srcURL, srcPrefix, srcBranch, err := parseSpec(flag.Arg(0))
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	dstURL, dstPrefix, dstBranch, err := parseSpec(flag.Arg(1))
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 	if srcURL == dstURL {
 		log.Error.Printf("source and destination cannot be the same")
 		flag.Usage()
@@ -218,7 +224,11 @@ func main() {
 			}
 			rules.stripCommits = append(rules.stripCommits, hash)
 		case "rewrite":
-			rules.rewrite = append(rules.rewrite, parseRewriteRule(parts[1]))
+			rule, err := parseRewriteRule(parts[1])
+			if err != nil {
+				log.Fatalf("%v", err)
+			}
+			rules.rewrite = append(rules.rewrite, rule)
 		default:
 			log.Fatalf("invalid rule type %s", parts[0])
 		}
@@ -976,19 +986,20 @@ func isProcessed(hex string, processed map[string]bool) bool {
 	return false
 }
 
-func parseSpec(spec string) (url, prefix, branch string) {
+// parseSpec splits a repository spec into its url, prefix, and branch
+// components, applying the documented defaults for omitted fields.
+func parseSpec(spec string) (url, prefix, branch string, err error) {
 	parts := strings.Split(spec, ",")
 	switch len(parts) {
 	case 1:
-		return parts[0], "", "master"
+		return parts[0], "", "master", nil
 	case 2:
-		return parts[0], parts[1], "master"
+		return parts[0], parts[1], "master", nil
 	case 3:
-		return parts[0], parts[1], parts[2]
+		return parts[0], parts[1], parts[2], nil
 	default:
-		log.Fatalf("invalid spec %s", spec)
+		return "", "", "", fmt.Errorf("invalid spec %s: too many comma-separated fields", spec)
 	}
-	panic("not reached")
 }
 
 type rewriteRule struct {
@@ -997,28 +1008,29 @@ type rewriteRule struct {
 	new    []byte         // replacement
 }
 
-func parseRewriteRule(rule string) (r rewriteRule) {
+// parseRewriteRule parses the parameter of a rewrite rule into its
+// path regexp, line regexp, and replacement.
+func parseRewriteRule(rule string) (r rewriteRule, err error) {
 	parts := strings.SplitN(rule, ":", 2)
 	if len(parts) != 2 {
-		log.Fatalf("invalid rewrite rule %s", rule)
+		return r, fmt.Errorf("invalid rewrite rule %s", rule)
 	}
-	var err error
 	if r.pathRe, err = regexp.Compile(parts[0]); err != nil {
-		log.Fatalf("rewrite: invalid path regexp %s: %s", parts[0], err)
+		return r, fmt.Errorf("rewrite: invalid path regexp %s: %s", parts[0], err)
 	}
 	if len(parts[1]) < 3 {
-		log.Fatalf("rewrite: rule '%s' must be of form rewrite:pathre:/from_re/to_re/", rule)
+		return r, fmt.Errorf("rewrite: rule '%s' must be of form rewrite:pathre:/from_re/to_re/", rule)
 	}
 	sep := parts[1][0:1]
 	parts = strings.Split(parts[1][1:], sep)
 	if len(parts) != 3 || parts[2] != "" {
-		log.Fatalf("rewrite: rule '%s' must be of form rewrite:pathre:/from_re/to_re/", rule)
+		return r, fmt.Errorf("rewrite: rule '%s' must be of form rewrite:pathre:/from_re/to_re/", rule)
 	}
 	if r.oldRe, err = regexp.Compile(parts[0]); err != nil {
-		log.Fatalf("rewrite: invalid 'from' regexp %s: %s", parts[0], err)
+		return r, fmt.Errorf("rewrite: invalid 'from' regexp %s: %s", parts[0], err)
 	}
 	r.new = []byte(parts[1])
-	return r
+	return r, nil
 }
 
 func (r *rewriteRule) rewrite(diff []byte) []byte {
