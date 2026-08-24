@@ -1,7 +1,3 @@
-// Copyright 2018 GRAIL, Inc. All rights reserved.
-// Use of this source code is governed by the Apache 2.0
-// license that can be found in the LICENSE file.
-
 package main_test
 
 import (
@@ -12,10 +8,8 @@ import (
 	"testing"
 )
 
-// TestSessionPauseResume verifies the persistent conflict lifecycle: a
-// genuine conflict pauses the session; a fresh grit invocation preserves
-// it; manual resolution plus am --continue persists; and the next grit
-// invocation pushes the resolved session.
+// TestSessionPauseResume verifies the persistent conflict lifecycle: pause,
+// preservation across invocations, manual resolution, and a later push.
 func TestSessionPauseResume(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -77,11 +71,8 @@ func TestSessionPauseResume(t *testing.T) {
 	}
 }
 
-// TestUnbornSourceFailsLoudly documents the pre-existing contract that
-// grit cannot synchronize from a repository without any commits: Open
-// fails loudly at fetch ("couldn't find remote ref"), identical to
-// pristine upstream d3b81e6 behavior. Object seeding therefore only ever
-// runs for sources whose branch exists.
+// TestUnbornSourceFailsLoudly documents Open failing loudly for a commitless
+// source ("couldn't find remote ref"), identical to pristine upstream d3b81e6.
 func TestUnbornSourceFailsLoudly(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -102,10 +93,8 @@ func TestUnbornSourceFailsLoudly(t *testing.T) {
 	}
 }
 
-// TestPauseWithoutPushThenPushLater verifies that a conflict paused by
-// a plain (non -push) run persists for resolution, and that a later
-// push-enabled run publishes the resolved session — the other half of
-// the preservation heuristic.
+// TestPauseWithoutPushThenPushLater verifies a conflict paused by a plain run
+// persists for resolution and is published by a later push-enabled run.
 func TestPauseWithoutPushThenPushLater(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -155,9 +144,8 @@ func TestPauseWithoutPushThenPushLater(t *testing.T) {
 	}
 }
 
-// TestForeignUnpushedStateAborts verifies that unpushed commits in the
-// destination clone that grit did not author (no shipit id at HEAD) abort
-// the run loudly instead of being preserved and later published.
+// TestForeignUnpushedStateAborts verifies unpushed destination commits grit did
+// not author abort the run loudly instead of being preserved and published.
 func TestForeignUnpushedStateAborts(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -188,10 +176,8 @@ func TestForeignUnpushedStateAborts(t *testing.T) {
 	}
 }
 
-// TestSourceCloneStrayStateIsDiscarded verifies the source clone's
-// read-through-cache contract: stray local commits (e.g. residue of a
-// linearized run) never abort or leak into synchronization; the next
-// run discards them and mirrors the remote tip.
+// TestSourceCloneStrayStateIsDiscarded verifies the read-through-cache contract:
+// stray local commits never abort or leak; the next run mirrors the remote tip.
 func TestSourceCloneStrayStateIsDiscarded(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -234,12 +220,8 @@ func TestSourceCloneStrayStateIsDiscarded(t *testing.T) {
 	}
 }
 
-// TestDivergedGritTailIsDiscardedNotPreserved pins the ancestry gate
-// end-to-end: an all-grit-authored unpushed tail whose base has
-// diverged from the advanced remote tip can never be pushed (every
-// push fails non-fast-forward), so Open must discard and reclone
-// immediately — letting the run converge against the actual remote tip
-// — instead of preserving the tail until a doomed push discards it.
+// TestDivergedGritTailIsDiscardedNotPreserved pins the ancestry gate: a diverged
+// all-grit tail can never push, so Open discards it instead of deferring loss.
 func TestDivergedGritTailIsDiscardedNotPreserved(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -282,10 +264,8 @@ func TestDivergedGritTailIsDiscardedNotPreserved(t *testing.T) {
 	}
 }
 
-// TestIndentedQuotationIsNotGritAuthored verifies that the
-// preservation gate's stricter flush-left requirement rejects a foreign
-// unpushed commit whose message merely quotes an id from an indented
-// block (which Log's dedentation would otherwise resurrect).
+// TestIndentedQuotationIsNotGritAuthored verifies the flush-left requirement
+// rejects indented id quotations that Log's dedentation would resurrect.
 func TestIndentedQuotationIsNotGritAuthored(t *testing.T) {
 	src, dst := setupGritRepos(t)
 

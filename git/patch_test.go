@@ -5,7 +5,7 @@ package git
 
 import (
 	"bytes"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -209,7 +209,7 @@ func TestParseDiffHeaderForms(t *testing.T) {
 // through (Patch).Write.
 func parsePatchRoundTrip(t *testing.T, path string) Patch {
 	t.Helper()
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("failed to read %q: %v", path, err)
 	}

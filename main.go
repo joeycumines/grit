@@ -447,7 +447,7 @@ commitsLoop:
 	// history. Shipit tags are the only synchronization state that
 	// persists through grit's push-only model, so they are what makes
 	// exactly-once processing hold for commits that selection alone
-	// cannot order with respect to the anchor — notably applied siblings
+	// cannot order with respect to the anchor, notably applied siblings
 	// of a failed run, which are not ancestors of its last applied
 	// commit. Legacy ids shorter than a full digest match by prefix,
 	// with the same collision window the anchor walk has always
@@ -625,12 +625,11 @@ commitsLoop:
 			nskipped++
 			continue
 		}
-		// A commit with pruned diffs is deliberately left without a
-		// shipit tag: tagging would permanently exclude it, freezing
-		// the pruned half even if the destination later loses that
-		// content. Untagged, it is re-examined on every run — the kept
-		// diffs no-op through three-way application while the pruned
-		// paths re-converge or resurface.
+		// A partially pruned commit stays untagged for the same reason
+		// as the fully converged ones above: tagging would freeze the
+		// pruned half even if the destination later loses it. Each run
+		// re-examines it; kept diffs no-op through three-way
+		// application while pruned paths re-converge or resurface.
 		pruned := len(diffs) - len(kept)
 		tagged := pruned == 0
 		if tagged {
@@ -678,8 +677,8 @@ commitsLoop:
 	// Push when this run applied anything, or when the repository still
 	// holds commits from a manually continued session that have not been
 	// pushed yet. Open only preserves unpushed state whose every commit
-	// is grit-authored — carrying a shipit id or a convergence-pruned
-	// marker — so an unpushed HEAD here is grit's own by construction;
+	// is grit-authored (carrying a shipit id or a convergence-pruned
+	// marker), so an unpushed HEAD here is grit's own by construction;
 	// the re-check keeps that invariant local and loud.
 	if ncommit == 0 {
 		head, err := dst.Head()
@@ -870,8 +869,8 @@ func srcRelativeDiffPaths(diffs []git.Diff, dstPrefix string) map[string]bool {
 // isProcessed reports whether the provided full source digest is
 // accounted for by a recorded shipit source id, either exactly or (for
 // legacy, abbreviated ids) by prefix. Residual ambiguity: a destination
-// message that quotes an id on its own line — including one whose
-// four-space indentation Log dedents away — is indistinguishable from a
+// message that quotes an id on its own line (including one whose
+// four-space indentation Log dedents away) is indistinguishable from a
 // real tag, the same exposure the anchor walk has always had.
 func isProcessed(hex string, processed map[string]bool) bool {
 	if processed[hex] {
@@ -997,11 +996,10 @@ func (r rules) isMessagePathStripped(path string) (bool, *regexp.Regexp) {
 var binaryPatchMarker = []byte("GIT binary patch")
 
 // rewriteDiff applies the rulesets rewrite rules to the provided diff.
-// Diffs carrying git binary sections are never rewritten. Note that git
-// serializes NUL-free binary files as ordinary textual diffs; such
-// payloads are indistinguishable from text at this level, so rewrite
-// rules should be anchored narrowly enough that they cannot match their
-// bytes.
+// Diffs carrying git binary sections are never rewritten: git
+// serializes NUL-free binary files as ordinary textual diffs, such
+// payloads are indistinguishable from text at this level, and rewrite
+// rules must therefore be anchored narrowly enough not to match them.
 func (r rules) rewriteDiff(diff *git.Diff) {
 	// The parser places binary payloads (including their "GIT binary
 	// patch" marker) in Meta and leaves Body empty; textual diffs carry
