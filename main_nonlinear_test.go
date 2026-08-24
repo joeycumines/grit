@@ -1,7 +1,3 @@
-// Copyright 2018 GRAIL, Inc. All rights reserved.
-// Use of this source code is governed by the Apache 2.0
-// license that can be found in the LICENSE file.
-
 package main_test
 
 import (
@@ -227,10 +223,9 @@ func setupGritRepos(t *testing.T) (src, dst *gritRepo) {
 	return src, dst
 }
 
-// TestGritNonLinearHistoryResume verifies that incremental sync copies
-// side-branch commits merged into the source branch after the last synced
-// commit. Against the upstream --ancestry-path behavior, the side branch
-// work is silently skipped and the final comparison fails.
+// TestGritNonLinearHistoryResume verifies incremental sync copies side-branch
+// commits merged into the source branch after the last synced commit; upstream
+// --ancestry-path behavior silently skips them.
 func TestGritNonLinearHistoryResume(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
