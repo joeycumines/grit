@@ -6,7 +6,6 @@ package main_test
 
 import (
 	"flag"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -173,7 +172,7 @@ func (r repo) WriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	path = filepath.Join(string(r), path)
 	_ = os.MkdirAll(filepath.Dir(path), 0777)
-	if err := ioutil.WriteFile(path, []byte(content), 0700); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0700); err != nil {
 		t.Fatalf("%s: write %s: %v", r, path, err)
 	}
 }

@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -657,6 +656,9 @@ func parseCommits(r *Repo, out []byte) (commits []*Commit, err error) {
 		for headers != nil {
 			line := scanLine(&headers)
 			keyval := strings.SplitN(string(line), ":", 2)
+			if len(keyval) != 2 {
+				return fmt.Errorf("malformed commit header %q for commit %s", line, c.Digest)
+			}
 			key, val := keyval[0], keyval[1]
 			val = strings.TrimLeftFunc(val, unicode.IsSpace)
 			c.Headers = append(c.Headers, Header{key, val})
@@ -831,14 +833,6 @@ func (r *Repo) PatchIsEmpty(id string) (bool, error) {
 	return len(out) == 0, nil
 }
 
-// CommitEmptyWithMessageFile creates an empty commit whose message is
-// read from the provided repository-relative file, preserving the
-// record of an applied patch that produced no changes.
-func (r *Repo) CommitEmptyWithMessageFile(relPath string) error {
-	_, err := r.git(nil, "commit", "--allow-empty", "-F", relPath)
-	return err
-}
-
 // ResetToRemote discards all local state in favor of the remote tip as
 // of the most recent Open (the originHead snapshot; a third-party push
 // after Open is picked up by the next run). Used after a failed push: a
@@ -892,7 +886,7 @@ func (r *Repo) ListLFSPointers() (pointers []string, err error) {
 // CopyLFSObject copies the object referred to by the provided pointer
 // from the given source repository.
 func (r *Repo) CopyLFSObject(src *Repo, pointer string) error {
-	p, err := ioutil.ReadFile(r.path(r.prefix, pointer))
+	p, err := os.ReadFile(r.path(r.prefix, pointer))
 	if err != nil {
 		return err
 	}
@@ -991,13 +985,13 @@ func (r *Repo) gitIOEnv(env []string, stdin io.Reader, stdout io.Writer, arg ...
 	cmd.Stdin = stdin
 	log.Debug.Printf("%s: git %s", r.root, strings.Join(arg, " "))
 	if err := cmd.Run(); err != nil {
-		outerr := string(stderr.Bytes())
+		outerr := stderr.String()
 		if len(outerr) > 0 {
 			outerr = "\n" + outerr
 		}
 		return fmt.Errorf("%s: git %s: error: %w%s", r.root, strings.Join(arg, " "), err, outerr)
 	}
-	outerr := string(stderr.Bytes())
+	outerr := stderr.String()
 	if len(outerr) > 0 {
 		outerr = "\n" + outerr
 	}
