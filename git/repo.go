@@ -210,7 +210,7 @@ func pathInPrefix(p, prefix string) bool {
 }
 
 // isCaseMismatch reports whether diffPath falls within prefix's scope
-// but differs from it by letter case alone — a state that tree-level
+// but differs from it by letter case alone, a state that tree-level
 // matching silently drops and that must therefore abort loudly.
 // Comparison is rune-wise simple case folding without any lowercasing
 // precheck, so fold-equivalent scripts (Greek sigma variants) count as
@@ -287,8 +287,8 @@ func (r *Repo) openLocked() (*Repo, error) {
 		return nil, err
 	}
 	// Capture the remote tip now: any later fetch (e.g. object seeding)
-	// overwrites FETCH_HEAD. Nothing re-reads FETCH_HEAD afterwards —
-	// ResetToRemote uses this snapshot — so the overwrite is harmless,
+	// overwrites FETCH_HEAD, and nothing re-reads FETCH_HEAD afterwards
+	// (ResetToRemote uses this snapshot), so the overwrite is harmless,
 	// which keeps grit compatible with git versions lacking
 	// --no-write-fetch-head.
 	originHead, err := r.RevParse("FETCH_HEAD")
@@ -300,13 +300,13 @@ func (r *Repo) openLocked() (*Repo, error) {
 	// Destination clones preserve work that must survive across grit
 	// invocations: a paused git am session awaiting conflict resolution,
 	// and commits that a continued session has already created but that
-	// have not been pushed yet. Every such commit is authored by grit —
-	// carrying a shipit id or a convergence-pruned marker, verified per
-	// commit — and discarding it would destroy manually resolved work.
+	// have not been pushed yet. Every such commit is authored by grit,
+	// carrying a shipit id or a convergence-pruned marker verified per
+	// commit, and discarding it would destroy manually resolved work.
 	// HEAD that is merely behind the remote tip is the normal case and
 	// gets reset. Source clones are read-through caches: their local
-	// state — including anything left behind by -linearize or a stray
-	// session — is always discarded in favor of the remote tip, as is
+	// state (including anything left behind by -linearize or a stray
+	// session) is always discarded in favor of the remote tip, as is
 	// the state of a freshly created clone, which simply starts wherever
 	// the remote's default branch points and may be unrelated to the
 	// configured branch.
@@ -388,7 +388,7 @@ func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
 // OriginHead returns the digest of the repository's remote tip for the
 // configured branch, as of the most recent Open. The value is a
 // snapshot: a concurrent third-party push makes comparisons against it
-// stale, which is benign here — the next run re-syncs, and a stale push
+// stale, which is benign here: the next run re-syncs, and a stale push
 // fails loudly rather than silently.
 func (r *Repo) OriginHead() string {
 	return r.originHead
@@ -399,9 +399,9 @@ var ownLineShipitIDRe = regexp.MustCompile(`(?m)^\s*(?:fb)?shipit-source-id: ([a
 var ownLineGritTagRe = regexp.MustCompile(`(?m)^fbshipit-source-id: ([a-z0-9]+)\r?$`)
 
 // OwnLineShipitIDs returns the shipit source ids recorded on their own
-// lines in the commit message — the form grit writes. Matching anywhere
+// lines in the commit message, the form grit writes. Matching anywhere
 // in the body would let prose that quotes an id be mistaken for one;
-// note that Log dedents four-space-indented lines, so indented
+// Log dedents four-space-indented lines, so indented
 // quotations of ids remain an accepted residual ambiguity shared with
 // ShipitID.
 func (c *Commit) OwnLineShipitIDs() []string {
@@ -413,7 +413,7 @@ func (c *Commit) OwnLineShipitIDs() []string {
 }
 
 // OwnLineGritTagIDs returns the subset of ids written flush-left with
-// the fb prefix — the exact serialization grit emits. Safety decisions
+// the fb prefix, the exact serialization grit emits. Safety decisions
 // about grit-authored state use this stricter form: prose quotations
 // are conventionally indented or unprefixed, and a false positive here
 // would publish foreign state.
@@ -429,7 +429,7 @@ var ownLineConvergenceMarkerRe = regexp.MustCompile(`(?m)^grit-convergence-prune
 
 // OwnLineConvergenceMarkers reports the convergence-pruned markers grit
 // writes on commits whose converged diffs were deliberately left
-// untagged — the second serialization the authorship gates accept.
+// untagged, the second serialization the authorship gates accept.
 // Each entry is the clean "old/new" id pair; line-ending bytes never
 // leak into the returned values, matching OwnLineShipitIDs and
 // OwnLineGritTagIDs.
@@ -721,7 +721,7 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 
 // rewriteDiffMeta rewrites the a/ and b/ pathnames inside a diff's
 // metadata section through fixPath, reproducing every other line
-// byte-for-byte — including per-line trailing carriage returns, which
+// byte-for-byte, including per-line trailing carriage returns, which
 // must survive round trips even though they never participate in
 // prefix inspection. The result carries no trailing newline, matching
 // Diff.Meta's contract.
@@ -848,8 +848,17 @@ func (r *Repo) ListLFSPointers() (pointers []string, err error) {
 	if err != nil {
 		return nil, err
 	}
-	prefix := []byte(r.prefix)
-	for lines != nil {
+	return lfsPointers(lines, r.prefix)
+}
+
+// lfsPointers filters a git-lfs ls-files listing down to the paths
+// under prefix, returning them prefix-stripped. Containment uses the
+// same directory-boundary semantics as patch routing: a path that
+// merely shares the prefix's leading bytes ("catrate.txt" under prefix
+// "catrate") is skipped whole instead of being retained and mangled by
+// a byte-level TrimPrefix.
+func lfsPointers(listing []byte, prefix string) (pointers []string, err error) {
+	for lines := listing; lines != nil; {
 		line := scanLine(&lines)
 		if len(line) == 0 {
 			continue
@@ -858,14 +867,14 @@ func (r *Repo) ListLFSPointers() (pointers []string, err error) {
 		if len(parts) != 3 {
 			return nil, fmt.Errorf("malformed git lfs ls-files output %q", line)
 		}
-		if !bytes.HasPrefix(parts[2], prefix) {
-			log.Debug.Printf("skipping LFS file %s: not in repo's prefix %s", parts[2], prefix)
+		path := string(parts[2])
+		if !pathInPrefix(path, prefix) {
+			log.Debug.Printf("skipping LFS file %s: not in repo's prefix %s", path, prefix)
 			continue
 		}
-		path := bytes.TrimPrefix(parts[2], prefix)
-		pointers = append(pointers, string(path))
+		pointers = append(pointers, strings.TrimPrefix(strings.TrimPrefix(path, prefix), "/"))
 	}
-	return
+	return pointers, nil
 }
 
 // CopyLFSObject copies the object referred to by the provided pointer
