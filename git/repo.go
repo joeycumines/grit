@@ -32,22 +32,16 @@ import (
 	"github.com/grailbio/base/log"
 )
 
-func init() {
-	// If we are testing in a sandboxed environment with no writable /var/tmp,
-	// we can use the TEST_TMPDIR environment variable to override the default
-	// location.
-	testTmp := os.Getenv("TEST_TMPDIR")
-	if testTmp != "" {
-		Dir = filepath.Join(testTmp, "grit")
-	}
-}
-
 // ErrStaleCloneCache reports that a clone cache held state that could
 // not be preserved and was removed; Open recovers by recloning.
 var ErrStaleCloneCache = errors.New("stale clone cache discarded")
 
-// Dir is the directory in which git checkouts are made.
-var Dir = "/var/tmp/grit"
+// Dir is the directory in which git checkouts are made. It resolves to
+// the OS temporary location by default, so caches are ephemeral and
+// bounded by grit's built-in sweep; pointing GRIT_CACHE_DIR at durable
+// storage is the explicit opt-in to persistent caching. TEST_TMPDIR
+// overrides both for sandboxed test environments.
+var Dir = resolveDir()
 
 // CachePath returns the clone directory grit derives for the provided
 // endpoint. The key covers everything that changes the clone's
@@ -251,10 +245,10 @@ func (r *Repo) openLocked() (*Repo, error) {
 	// Announce caches abandoned by the key derivation change (they were
 	// keyed by URL alone): paused sessions or resolved-but-unpushed work
 	// left there by older versions require manual attention before they
-	// are lost to cleanup.
+	// are lost to cleanup. The notice fires at most once per process.
 	legacy := LegacyCachePath(r.url)
 	if legacy != r.root {
-		if _, err := os.Stat(legacy); err == nil {
+		if _, err := os.Stat(legacy); err == nil && announceLegacy(legacy) {
 			log.Printf("note: legacy clone cache %s is no longer used; inspect it for paused sessions before deleting", legacy)
 		}
 	}
@@ -303,6 +297,7 @@ func (r *Repo) openLocked() (*Repo, error) {
 		return nil, err
 	}
 	r.originHead = originHead
+	touchHeartbeat(r.root)
 	// Destination clones preserve work that must survive across grit
 	// invocations: a paused git am session awaiting conflict resolution,
 	// and commits that a continued session has already created but that
