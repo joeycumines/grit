@@ -480,6 +480,20 @@ commitsLoop:
 	}
 	var ncommit int
 	var nskipped int
+	// An initial sync that finds nothing to copy is legitimate for a
+	// brand-new module, but it is indistinguishable from a misspelled
+	// prefix. When the prefix never existed anywhere in the source
+	// history, say so loudly (non-fatally: legitimately empty modules
+	// must stay workable).
+	if lastCommit == nil && len(commits) == 0 && srcPrefix != "" {
+		existed, err := src.PrefixEverExisted(srcPrefix)
+		if err != nil {
+			log.Printf("warning: could not probe whether prefix %q ever existed: %v", srcPrefix, err)
+		} else if !existed {
+			log.Error.Printf("warning: %s: prefix %q does not exist anywhere in the source history; "+
+				"check the spelling of the prefix field", src, srcPrefix)
+		}
+	}
 	for i := len(commits) - 1; i >= 0; i-- {
 		c := commits[i]
 		isMerge, err := src.IsMerge(c.Digest.Hex())

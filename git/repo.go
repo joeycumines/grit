@@ -583,10 +583,12 @@ func (r *Repo) Log(args ...string) (commits []*Commit, err error) {
 	}
 	out, err := r.git(nil, args...)
 	if err != nil {
-		// Tolerate exactly upstream's tolerated failure: a pathspec
-		// absent from the working tree. Matching on git's message keeps
-		// every other failure loud; a localized git would turn this one
-		// case loud as well, which is the safe direction.
+		// A pathspec that never existed in history yields empty output
+		// and a successful exit on every git this supports, so this
+		// branch is retained only for older gits that failed loudly with
+		// this exact message. The empty result is the operative guard,
+		// and the never-existed warning in main is what surfaces the
+		// misconfiguration to the operator.
 		if strings.Contains(err.Error(), "path not in the working tree") {
 			log.Printf("%s: prefix %q is absent; treating log as empty", r.root, r.prefix)
 			return nil, nil
@@ -797,6 +799,23 @@ func (r *Repo) PatchIsEmpty(id string) (bool, error) {
 		return false, err
 	}
 	return len(out) == 0, nil
+}
+
+// PrefixEverExisted reports whether any commit in the repository's
+// history contains a path under the provided prefix. A prefix that
+// never existed anywhere is the signature of a misspelled module name:
+// selection legitimately finds nothing, but the misconfiguration would
+// otherwise stay silent forever.
+func (r *Repo) PrefixEverExisted(prefix string) (bool, error) {
+	out, err := r.git(nil, "rev-list", "--count", "HEAD", "--", ":(literal)"+prefix)
+	if err != nil {
+		return false, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return false, fmt.Errorf("malformed rev-list --count output %q: %v", out, err)
+	}
+	return count > 0, nil
 }
 
 // ResetToRemote discards all local state in favor of the remote tip as
