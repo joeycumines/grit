@@ -168,8 +168,13 @@ func TestTagSetExclusionExactlyOnce(t *testing.T) {
 	if !strings.Contains(out, "skipping already synchronized") {
 		t.Fatalf("tag-set exclusion did not fire:\n%s", out)
 	}
-	if strings.Contains(out, "skipping converged") {
-		t.Fatalf("prune fired where tag exclusion should have:\n%s", out)
+	// The siblings must be excluded by their tags, not by content
+	// pruning. The oracle names the per-path prune signature: merges in
+	// the re-selected range legitimately report their own state
+	// convergence ("skipping converged merge ..."), which shares no
+	// path with the regular-commit message.
+	if strings.Contains(out, "skipping converged a.txt") || strings.Contains(out, "skipping converged b.txt") {
+		t.Fatalf("regular-commit prune fired where tag exclusion should have:\n%s", out)
 	}
 	dst.pull()
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)

@@ -25,6 +25,27 @@
 // limited to the given prefix path. Changes outside of this prefix are
 // discarded.
 //
+// # Merge commits
+//
+// Merge commits in the source history are replicated as well. Each
+// merge is reconciled at its position in the topological order, after
+// all of its ancestors' changes have been applied: the state the
+// merge's own tree records for the paths it touches is written to the
+// destination, and whatever differs from that state is applied as an
+// ordinary corrective commit tagged with the merge's digest. This
+// replicates content that no patch can express on its own, such as
+// hand-resolved conflict results ("evil merges") and the discards of
+// merges made with "-s ours". A merge whose result matches the
+// already-replicated state creates no commit at all. Convergence cuts
+// both ways: a competing destination-side edit on a path the merge
+// resolves is superseded rather than paused, while edits on paths the
+// merge's ancestor commits touch pause through their own application.
+// Because reconciliation enforces the merged tree's content, a
+// "-s subtree"
+// merge whose structural relocation crosses the configured prefix is
+// out of scope: its relocated layout cannot be expressed by prefix
+// filtering alone.
+//
 // # Linearization
 //
 // If the flag -linearize is provided, then the source repository's
@@ -258,14 +279,14 @@ func main() {
 
 	// Make the source repository's objects available in the destination
 	// clone, so that three-way merges have the pre-image blobs recorded
-	// by patches at their disposal. Open guarantees a resolvable source
-	// branch by this point. Dump mode never applies patches or pushes;
-	// like every run it still refreshes its repository clones, and it is
-	// subject to the preservation gate on foreign unpushed state.
-	if !*dump {
-		if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
-			log.Fatalf("fetch source objects: %v", err)
-		}
+	// by patches at their disposal, and merge reconciliation can read
+	// the source trees it rewrites into destination state. Open
+	// guarantees a resolvable source branch by this point. Dump mode
+	// never applies patches or pushes; like every run it still refreshes
+	// its repository clones, and it is subject to the preservation gate
+	// on foreign unpushed state.
+	if err := dst.FetchObjects(src.RepoRoot(), srcBranch); err != nil {
+		log.Fatalf("fetch source objects: %v", err)
 	}
 
 	// Configuration mistakes that would silently mirror nothing must
@@ -354,8 +375,10 @@ func main() {
 		log.Printf("performing initial sync")
 		var err error
 		// Topological order guarantees that every commit is applied after
-		// its ancestors, regardless of authorship dates or merges.
-		commits, err = src.Log("--no-merges", "--topo-order", "--full-history")
+		// its ancestors, regardless of authorship dates or merges. Merge
+		// commits are included: each is reconciled at its topological
+		// position after all of its ancestors' changes have been applied.
+		commits, err = src.Log("--topo-order", "--full-history")
 		if err != nil {
 			log.Fatalf("log %s: %v", src, err)
 		}
@@ -383,8 +406,9 @@ func main() {
 		// parents ahead of children so patches apply in dependency order,
 		// and --full-history defeats git's default history simplification,
 		// which would otherwise hide commits whose prefix effect duplicates
-		// a surviving merge parent's tree.
-		commits, err = src.Log(newestID+".."+srcBranch, "--topo-order", "--no-merges", "--full-history")
+		// a surviving merge parent's tree. Merge commits themselves are
+		// included and reconciled at their topological position.
+		commits, err = src.Log(newestID+".."+srcBranch, "--topo-order", "--full-history")
 		if err != nil {
 			log.Fatalf("log %s: %v", src, err)
 		}
@@ -441,6 +465,79 @@ commitsLoop:
 	var nskipped int
 	for i := len(commits) - 1; i >= 0; i-- {
 		c := commits[i]
+		isMerge, err := src.IsMerge(c.Digest.Hex())
+		if err != nil {
+			log.Fatalf("%s: inspecting %s for merge parents: %v", src, c.Digest.Hex()[:7], err)
+		}
+		if isMerge {
+			// Merge content cannot be serialized by format-patch; the
+			// merge is reconciled instead: its net effect at this
+			// topological position becomes an ordinary corrective patch.
+			patch, empty, err := reconcilePatch(src, dst, c)
+			if err != nil {
+				log.Fatalf("%s: reconcile merge %s: %v", src, c.Digest.Hex()[:7], err)
+			}
+			if empty {
+				log.Printf("skipping converged merge %s", c)
+				continue
+			}
+			// The same path rules gate merged content as gate regular
+			// commits: stripped paths never reach the destination, and
+			// rewrite rules transform what does. Convergence pruning is
+			// unnecessary here: TreeDiffs already emits only paths whose
+			// desired state differs from the destination tree.
+			var mdiffs []git.Diff
+			stripMessage := true
+		mdiffloop:
+			for _, diff := range patch.Diffs {
+				if match, re := rules.isPathStripped(diff.Path); match {
+					log.Debug.Printf("file %s matches rule %s: stripping", diff.Path, re)
+					continue mdiffloop
+				}
+				if match, _ := rules.isMessagePathStripped(diff.Path); !match {
+					stripMessage = false
+				}
+				rules.rewriteDiff(&diff)
+				mdiffs = append(mdiffs, diff)
+			}
+			if len(mdiffs) == 0 {
+				log.Printf("skipping merge %s: every changed path is stripped", c)
+				continue
+			}
+			total := len(patch.Diffs)
+			patch.Diffs = mdiffs
+			shipitTag := fmt.Sprintf("fbshipit-source-id: %s", patch.ID.Hex())
+			if pruned := total - len(mdiffs); pruned > 0 {
+				// A partially stripped merge stays untagged so it is
+				// re-examined if the rules change, mirroring regular
+				// convergence pruning; the marker documents why it
+				// carries no tag.
+				patch.Body += fmt.Sprintf("\ngrit-convergence-pruned: %d/%d", pruned, total)
+				log.Printf("%s: %d of %d merged paths stripped by rules; merge will remain re-examinable", c, pruned, total)
+			} else {
+				if patch.Body != "" {
+					patch.Body += "\n\n"
+				}
+				patch.Body += shipitTag
+				if stripMessage {
+					patch.Subject = "Stripped commit"
+					patch.Body = "Commit message stripped.\n\n" + shipitTag
+				}
+			}
+			if *dump {
+				// Unlike regular commits, the merge's diffs were already
+				// pruned against the pre-run destination tree, so a dump
+				// previews what this merge contributes relative to the
+				// untouched destination rather than to the state earlier
+				// dumps in the same run pretend to have reached.
+				if err := patch.Write(os.Stdout); err != nil {
+					log.Fatal(err)
+				}
+				continue
+			}
+			applyPatch(dst, src, patch, c, &ncommit)
+			continue
+		}
 		patch, err := src.Patch(c.Digest, dst.Prefix())
 		if err != nil {
 			log.Fatalf("%s: patch %s: %v", src, c.Digest.Hex()[:7], err)
@@ -551,11 +648,6 @@ commitsLoop:
 		// grows from the tags that do land), so the imprecision is
 		// benign, and counting outcomes keeps untagged re-examinations
 		// from spamming empty pushes.
-		headBeforeApply, err := dst.Head()
-		if err != nil {
-			log.Fatal(err)
-		}
-		ncommit++
 		patch.Diffs = kept
 		if stripMessage && tagged {
 			patch.Subject = "Stripped commit"
@@ -565,47 +657,9 @@ commitsLoop:
 			if err := patch.Write(os.Stdout); err != nil {
 				log.Fatal(err)
 			}
-		} else {
-			log.Printf("applying %s", c)
-			if err := dst.Apply(patch); err != nil {
-				if inProgress, _ := dst.InProgressAM(); inProgress {
-					log.Printf("conflict: %s did not apply cleanly", patch)
-					log.Printf("the session is paused for manual resolution in %s", dst.RepoRoot())
-					log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
-					log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
-					log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
-					log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
-					log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
-				}
-				log.Fatalf("%s: apply %s: %s", dst, patch, err)
-			}
-			if headAfterApply, herr := dst.Head(); herr == nil && headAfterApply == headBeforeApply {
-				// Three-way application concluded that the destination
-				// already contained this change: nothing was committed.
-				ncommit--
-				log.Printf("no changes for %s; treated as converged", c)
-			}
-			if !patch.MaybeContainsLFSPointer() {
-				log.Debug.Printf("%s: patch contains no LFS pointers", patch)
-				continue
-			}
-			// Copy any LFS objects that were touched by this change.
-			// Doing it this way allows us to download only LFS objects
-			// that actually need to be transferred.
-			srcRelative := srcRelativeDiffPaths(patch.Diffs, dst.Prefix())
-			ptrs, err := dst.ListLFSPointers()
-			if err != nil {
-				log.Fatal(err)
-			}
-			for _, ptr := range ptrs {
-				if !srcRelative[ptr] {
-					continue
-				}
-				if err := dst.CopyLFSObject(src, ptr); err != nil {
-					log.Fatalf("copying LFS object %s: %v", ptr, err)
-				}
-			}
+			continue
 		}
+		applyPatch(dst, src, patch, c, &ncommit)
 	}
 	if nskipped > 0 {
 		log.Printf("%d commits skipped as already converged", nskipped)
@@ -651,6 +705,122 @@ commitsLoop:
 			log.Printf("discarded local state after failed push; re-run this command to recompute against the destination's current tip")
 		}
 		log.Fatalf("%s: push origin %s: %v", dst, dstBranch, err)
+	}
+}
+
+// reconcilePatch derives the corrective patch replicating merge m's net
+// effect at its topological position, where every ancestor change has
+// already been applied to the destination. The desired state is the
+// merge's own tree restricted to the paths the merge touched within the
+// source prefix, relocated under the destination prefix. The difference
+// is taken against the destination's current tree, so the corrective
+// patch converges those paths to the merged state by construction and,
+// before rewrite rules transform it, cannot itself conflict: a
+// destination-side edit on a
+// path the merge resolves is superseded rather than paused. Conflicts
+// on paths the merge's ancestor commits touch still pause loudly
+// through their own three-way application. Hand-resolved ("evil")
+// content and "-s ours" discards are both expressed this way,
+// byte-exactly.
+// The returned patch is untagged: the caller decides between the merge's
+// shipit tag and a re-examinability marker after applying path rules.
+// An empty result reports a converged state: trivial merges replicate
+// nothing and take no tag.
+func reconcilePatch(src, dst *git.Repo, m *git.Commit) (git.Patch, bool, error) {
+	commits, err := src.LogIgnoringPrefix("-1", "--date=rfc2822", m.Digest.Hex())
+	if err != nil {
+		return git.Patch{}, false, err
+	}
+	if len(commits) != 1 {
+		return git.Patch{}, false, fmt.Errorf("log -1 %s returned %d commits", m.Digest.Hex()[:7], len(commits))
+	}
+	mc := commits[0]
+	parents, err := src.Parents(m.Digest.Hex())
+	if err != nil {
+		return git.Patch{}, false, err
+	}
+	entries, removals, err := src.MergeChangeset(m.Digest.Hex(), parents, dst.Prefix())
+	if err != nil {
+		return git.Patch{}, false, err
+	}
+	if len(entries) == 0 && len(removals) == 0 {
+		return git.Patch{}, true, nil
+	}
+	desired, err := dst.DesiredTree(entries, removals)
+	if err != nil {
+		return git.Patch{}, false, err
+	}
+	diffs, err := dst.TreeDiffs(desired)
+	if err != nil {
+		return git.Patch{}, false, err
+	}
+	if len(diffs) == 0 {
+		return git.Patch{}, true, nil
+	}
+	when, err := mc.AuthorTime()
+	if err != nil {
+		return git.Patch{}, false, err
+	}
+	subject := mc.Title()
+	patch := git.Patch{
+		ID:      m.Digest,
+		Author:  mc.AuthorIdent(),
+		Time:    when,
+		Subject: subject,
+		Body:    strings.TrimSpace(strings.TrimPrefix(mc.Body, subject)),
+		Diffs:   diffs,
+	}
+	return patch, false, nil
+}
+
+// applyPatch applies patch to the destination repository with loud
+// pausing on genuine conflicts, counts commits that actually moved the
+// destination HEAD into *ncommit, and copies any LFS objects the patch
+// touches from the source repository.
+func applyPatch(dst, src *git.Repo, patch git.Patch, c *git.Commit, ncommit *int) {
+	headBeforeApply, err := dst.Head()
+	if err != nil {
+		log.Fatal(err)
+	}
+	*ncommit++
+	log.Printf("applying %s", c)
+	if err := dst.Apply(patch); err != nil {
+		if inProgress, _ := dst.InProgressAM(); inProgress {
+			log.Printf("conflict: %s did not apply cleanly", patch)
+			log.Printf("the session is paused for manual resolution in %s", dst.RepoRoot())
+			log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
+			log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
+			log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
+			log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
+			log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
+		}
+		log.Fatalf("%s: apply %s: %s", dst, patch, err)
+	}
+	if headAfterApply, herr := dst.Head(); herr == nil && headAfterApply == headBeforeApply {
+		// Three-way application concluded that the destination already
+		// contained this change: nothing was committed.
+		*ncommit--
+		log.Printf("no changes for %s; treated as converged", c)
+	}
+	if !patch.MaybeContainsLFSPointer() {
+		log.Debug.Printf("%s: patch contains no LFS pointers", patch)
+		return
+	}
+	// Copy any LFS objects that were touched by this change.
+	// Doing it this way allows us to download only LFS objects
+	// that actually need to be transferred.
+	srcRelative := srcRelativeDiffPaths(patch.Diffs, dst.Prefix())
+	ptrs, err := dst.ListLFSPointers()
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, ptr := range ptrs {
+		if !srcRelative[ptr] {
+			continue
+		}
+		if err := dst.CopyLFSObject(src, ptr); err != nil {
+			log.Fatalf("copying LFS object %s: %v", ptr, err)
+		}
 	}
 }
 
