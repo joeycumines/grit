@@ -259,6 +259,50 @@ func TestPrefixPatchApply(t *testing.T) {
 	`)
 }
 
+// TestLFSPoinersBoundaryContainment pins that LFS pointer listing
+// treats the prefix as a directory boundary identically to patch
+// routing: sibling names that merely share the prefix's leading bytes
+// are skipped whole rather than retained and mangled by TrimPrefix.
+func TestLFSPoinersBoundaryContainment(t *testing.T) {
+	line := func(path string) string { return "* fake-oid " + path }
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		paths  []string
+		want   []string
+	}{
+		{"slashed prefix keeps nested", "proj/", []string{"proj/a.bin"}, []string{"a.bin"}},
+		{"unslashed prefix keeps nested", "proj", []string{"proj/a.bin"}, []string{"a.bin"}},
+		{"sibling filename skipped whole", "catrate", []string{"catrate.txt"}, nil},
+		{"exact name equality kept", "catrate", []string{"catrate"}, []string{""}},
+		{"unrelated path skipped", "proj/", []string{"other/x.bin"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var listing []byte
+			for _, p := range tc.paths {
+				listing = append(listing, []byte(line(p)+"\n")...)
+			}
+			got, err := lfsPointers(listing, tc.prefix)
+			if err != nil {
+				t.Fatalf("lfsPointers: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("pointers = %q, want %q", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("pointers[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+	t.Run("malformed line errors", func(t *testing.T) {
+		if _, err := lfsPointers([]byte(line("a.bin")+"\nnot-enough-fields\n"), "p/"); err == nil {
+			t.Fatal("malformed listing parsed without error")
+		}
+	})
+}
+
 func TestLFS(t *testing.T) {
 	_, err := exec.LookPath("lfs-test-server")
 	if err != nil {
@@ -676,8 +720,8 @@ const gritAuthoredMessage = "resolved session\n\nfbshipit-source-id: 0123456789a
 // TestPreservedTailRequiresRemoteAncestry pins the preservation gate's
 // scope: an unpushed tail qualifies for preservation only when it
 // descends from the provided remote tip. A diverged tail (sharing only
-// a deeper merge base) can never be pushed — every push fails
-// non-fast-forward — so it must report unpreservable and let the caller
+// a deeper merge base) can never be pushed (every push fails
+// non-fast-forward), so it must report unpreservable and let the caller
 // reclone, instead of deferring the loss to a doomed push cycle.
 func TestPreservedTailRequiresRemoteAncestry(t *testing.T) {
 	dir, cleanup := testutil.TempDir(t, "", "")
