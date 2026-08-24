@@ -923,12 +923,28 @@ func (r *Repo) git(stdin []byte, arg ...string) ([]byte, error) {
 	return out.Bytes(), err
 }
 
+// gitEnv behaves like git but runs the command with the provided extra
+// environment entries layered over the process environment.
+func (r *Repo) gitEnv(env []string, stdin []byte, arg ...string) ([]byte, error) {
+	var in io.Reader
+	if stdin != nil {
+		in = bytes.NewReader(stdin)
+	}
+	var out bytes.Buffer
+	err := r.gitIOEnv(env, in, &out, arg...)
+	return out.Bytes(), err
+}
+
 // GitIO invokes a git command on the repository r. The provided
 // arguments are passed to "git"; reader stdin is plumbed to the
 // process input and its output is written to writer stdout. If an
 // error occurs during the invocation of the "git" command, its
 // standard error is included in the returned error.
 func (r *Repo) gitIO(stdin io.Reader, stdout io.Writer, arg ...string) error {
+	return r.gitIOEnv(nil, stdin, stdout, arg...)
+}
+
+func (r *Repo) gitIOEnv(env []string, stdin io.Reader, stdout io.Writer, arg ...string) error {
 	args := []string{"-C", r.root}
 	for k, v := range r.config {
 		args = append(args, "-c")
@@ -937,12 +953,13 @@ func (r *Repo) gitIO(stdin io.Reader, stdout io.Writer, arg ...string) error {
 	args = append(args, arg...)
 	cmd := exec.Command("git", args...)
 	cmd.Stdout = stdout
+	cmd.Env = append(os.Environ(), env...)
+	if len(arg) > 0 && arg[0] != "lfs" {
+		cmd.Env = append(cmd.Env, "GIT_LFS_SKIP_SMUDGE=1")
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdin = stdin
-	if len(arg) > 0 && arg[0] != "lfs" {
-		cmd.Env = append(os.Environ(), "GIT_LFS_SKIP_SMUDGE=1")
-	}
 	log.Debug.Printf("%s: git %s", r.root, strings.Join(arg, " "))
 	if err := cmd.Run(); err != nil {
 		outerr := string(stderr.Bytes())
