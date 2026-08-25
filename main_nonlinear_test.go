@@ -327,7 +327,7 @@ func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 	src.commit("mainline feature after absorption")
 	src.push()
 
-	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	out := gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
 	for _, leaked := range []struct{ digest, subject string }{
 		{foreignImport, "upstream: initial import"},
 		{foreignHarden, "upstream: harden legacy path"},
@@ -360,7 +360,7 @@ func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 		t.Fatalf("post-absorption mainline commit did not land: %q", got)
 	}
 
-	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	out = gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
 	if !strings.Contains(out, "nothing to do") {
 		t.Fatalf("absorbed history did not reach a fixed point:\n%s", out)
 	}
