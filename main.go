@@ -62,7 +62,11 @@
 // copies every commit in X..<branch> -- including commits merged in
 // from side branches after X was synced -- and applies them in
 // topological order, so linear histories are not required for
-// correctness.
+// correctness. Commits merged in from a history sharing no common
+// ancestor with X, such as an entire repository absorbed with "merge
+// --allow-unrelated-histories", are excluded from that enumeration:
+// their patches assume parent states the destination never held, so
+// they are replicated only through the merges' own reconciliation.
 //
 // # Rules
 //
@@ -394,6 +398,9 @@ func main() {
 		}
 	}
 	var commits []*git.Commit
+	// Source-side resume revision: the shipit id recorded on lastCommit,
+	// empty for initial synchronization.
+	var srcAnchor string
 	if lastCommit == nil {
 		log.Printf("performing initial sync")
 		var err error
@@ -421,6 +428,7 @@ func main() {
 			log.Fatalf("no fbshipit-source-id found in commit: %+v", lastCommit)
 		}
 		newestID := ids[len(ids)-1]
+		srcAnchor = newestID
 		var err error
 		// Copy every source commit in newestID..srcBranch, not only those
 		// that descend from newestID: work merged into srcBranch from side
@@ -442,7 +450,7 @@ func main() {
 	// required: a source message merely quoting another mirror's id in
 	// prose must not cause its changes to be silently dropped.
 	// We also filter out commits that match any stripped commits.
-	raw := commits
+	raw := dropForeignMergedAncestry(src, commits, srcAnchor)
 	commits = nil
 commitsLoop:
 	for _, commit := range raw {
@@ -858,6 +866,60 @@ func applyPatch(dst, src *git.Repo, patch git.Patch, c *git.Commit, ncommit *int
 			log.Fatalf("copying LFS object %s: %v", ptr, err)
 		}
 	}
+}
+
+// dropForeignMergedAncestry removes candidates merged in from a history
+// sharing no common ancestor with the source-side resume revision ("repo
+// absorption" merges): such patches are expressed against parent states the
+// destination never held, so replaying them corrupts drifted files, while
+// their net content arrives through the merges' own reconciliation. Internal
+// side branches, which do share history with the anchor, keep being copied
+// individually. An empty anchor revision (initial synchronization) is passed
+// through unchanged.
+func dropForeignMergedAncestry(src *git.Repo, commits []*git.Commit, srcAnchor string) []*git.Commit {
+	if srcAnchor == "" {
+		return commits
+	}
+	var foreign map[string]bool
+	for _, c := range commits {
+		parents, err := src.Parents(c.Digest.Hex())
+		if err != nil {
+			log.Fatalf("%s: inspecting %s for merge parents: %v", src, c.Digest.Hex()[:7], err)
+		}
+		if len(parents) < 2 {
+			continue
+		}
+		for _, parent := range parents[1:] {
+			shared, err := src.HasCommonAncestor(srcAnchor, parent)
+			if err != nil {
+				log.Fatalf("%s: merge-base against merged-in parent %s: %v", src, parent[:7], err)
+			}
+			if shared {
+				continue
+			}
+			lineage, err := src.RevListExcluding(parent, srcAnchor)
+			if err != nil {
+				log.Fatalf("%s: rev-list %s: %v", src, parent[:7], err)
+			}
+			if foreign == nil {
+				foreign = make(map[string]bool, len(lineage))
+			}
+			for _, hex := range lineage {
+				foreign[hex] = true
+			}
+			log.Printf("merge %s brings unrelated history via parent %s: excluding %d commits from replay; their content arrives through the merge reconciliation", c, parent[:7], len(lineage))
+		}
+	}
+	if len(foreign) == 0 {
+		return commits
+	}
+	kept := make([]*git.Commit, 0, len(commits))
+	for _, c := range commits {
+		if !foreign[c.Digest.Hex()] {
+			kept = append(kept, c)
+		}
+	}
+	return kept
 }
 
 // processedSourceIDs returns the set of shipit source ids recorded in

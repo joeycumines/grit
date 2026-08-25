@@ -385,6 +385,40 @@ func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
 	return strings.TrimSpace(string(out)) == ancestor, nil
 }
 
+// HasCommonAncestor reports whether the two revisions share any common
+// ancestor, i.e., whether their histories intersect at all. Git documents
+// merge-base's exit status 1 as "no merge base found", which is exactly the
+// disjoint case; every other failure is an error rather than a silent
+// negative.
+func (r *Repo) HasCommonAncestor(a, b string) (bool, error) {
+	_, err := r.git(nil, "merge-base", a, b)
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+// RevListExcluding returns the digests of commits reachable from tip but not
+// reachable from any of the excluded revisions.
+func (r *Repo) RevListExcluding(tip string, exclude ...string) ([]string, error) {
+	args := append([]string{"rev-list", tip, "--not"}, exclude...)
+	out, err := r.git(nil, args...)
+	if err != nil {
+		return nil, err
+	}
+	var commits []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line != "" {
+			commits = append(commits, line)
+		}
+	}
+	return commits, nil
+}
+
 // OriginHead returns the digest of the repository's remote tip for the
 // configured branch, as of the most recent Open. The value is a
 // snapshot: a concurrent third-party push makes comparisons against it
@@ -983,7 +1017,7 @@ func (r *Repo) gitIOEnv(env []string, stdin io.Reader, stdout io.Writer, arg ...
 		if len(outerr) > 0 {
 			outerr = "\n" + outerr
 		}
-		return fmt.Errorf("%s: git %s: error: %v%s", r.root, strings.Join(arg, " "), err, outerr)
+		return fmt.Errorf("%s: git %s: error: %w%s", r.root, strings.Join(arg, " "), err, outerr)
 	}
 	outerr := stderr.String()
 	if len(outerr) > 0 {

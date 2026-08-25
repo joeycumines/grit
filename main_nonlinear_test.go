@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -288,6 +289,73 @@ func TestGritNonLinearHistoryResume(t *testing.T) {
 	}
 	if string(sideContent) != "b" {
 		t.Fatalf("side.txt = %q, want final side-branch value %q", sideContent, "b")
+	}
+}
+
+// TestGritUnrelatedMergedHistoryIsReconciledNotReplayed pins the absorption
+// rule: commits merged in from an unrelated history arrive through their
+// merge's reconciliation, never as individually replayed patches -- their
+// diffs assume parent states the destination never held.
+func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// A foreign repository's history enters the source repository through
+	// an unrelated-histories merge: an orphan lineage sharing no commit
+	// object with the source branch.
+	src.git("checkout", "--orphan", "foreign")
+	src.git("rm", "-rf", ".")
+	src.write("proj/upstream-legacy.txt", "v1")
+	src.commit("upstream: initial import")
+	src.write("proj/upstream-legacy.txt", "v2")
+	src.commit("upstream: harden legacy path")
+	src.git("checkout", testBranch)
+	src.git("merge", "--allow-unrelated-histories", "--no-ff",
+		"-m", "Merge unrelated upstream history", "foreign")
+
+	src.write("proj/main-feature.txt", "F")
+	src.commit("mainline feature after absorption")
+	src.push()
+
+	out := gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "applying upstream:") {
+		t.Fatalf("unrelated merged history was replayed as patches:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	subjects := dst.gitOut("log", "--format=%s")
+	for _, bad := range []string{"upstream: initial import", "upstream: harden legacy path"} {
+		if strings.Contains(subjects, bad) {
+			t.Fatalf("commit from unrelated merged history was copied into the destination: %q\nall subjects:\n%s", bad, subjects)
+		}
+	}
+
+	// Exactly four commits may exist: the seed, the mirrored first
+	// commit, the merge's reconciliation, and the mainline feature. Any
+	// more means foreign lineage leaked through as individual copies.
+	if got := strings.Count(strings.TrimSpace(dst.gitOut("log", "--format=%H")), "\n") + 1; got != 4 {
+		t.Fatalf("destination carries %d commits, want exactly 4:\n%s", got, dst.gitOut("log", "--oneline"))
+	}
+
+	if got := dstRead(t, dst.dir, "upstream-legacy.txt"); got != "v2" {
+		t.Fatalf("merge reconciliation did not land the absorbed content: %q", got)
+	}
+	if got := dstRead(t, dst.dir, "main-feature.txt"); got != "F" {
+		t.Fatalf("post-absorption mainline commit did not land: %q", got)
+	}
+
+	out = gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("absorbed history did not reach a fixed point:\n%s", out)
 	}
 }
 

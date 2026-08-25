@@ -908,3 +908,82 @@ func shell(t *testing.T, dir, script string) {
 	}
 	t.Log(stderr.String())
 }
+
+func TestHasCommonAncestorAndRevListExcluding(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	if *nocleanup {
+		log.Println("directory", dir)
+	} else {
+		defer cleanup()
+	}
+	shell(t, dir, `
+		git init --bare repo
+		git clone repo checkout
+		cd checkout
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -m'base'
+		git checkout --orphan foreign
+		git rm -rf .
+		echo legacy > legacy.txt
+		git add .
+		git commit -m'foreign root'
+		git checkout master
+		git merge --allow-unrelated-histories --no-ff -m'merge foreign' foreign
+		echo more > more.txt
+		git add .
+		git commit -m'mainline child'
+		git push
+	`)
+	repo, err := Open(filepath.Join(dir, "repo"), "", "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	base, err := repo.RevParse("master~2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignTip, err := repo.RevParse("master^^2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip, err := repo.RevParse("master")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shared, err := repo.HasCommonAncestor(base, tip)
+	if err != nil || !shared {
+		t.Fatalf("HasCommonAncestor(base, master) = %v, %v; want true", shared, err)
+	}
+	disjoint, err := repo.HasCommonAncestor(base, foreignTip)
+	if err != nil || disjoint {
+		t.Fatalf("HasCommonAncestor(base, foreign tip) = %v, %v; want false", disjoint, err)
+	}
+	self, err := repo.HasCommonAncestor(foreignTip, foreignTip)
+	if err != nil || !self {
+		t.Fatalf("HasCommonAncestor(foreign tip, itself) = %v, %v; want true", self, err)
+	}
+
+	lineage, err := repo.RevListExcluding(foreignTip, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lineage) != 1 || lineage[0] != foreignTip {
+		t.Fatalf("RevListExcluding(foreign tip, base) = %v; want [%s]", lineage, foreignTip)
+	}
+	none, err := repo.RevListExcluding(base, base)
+	if err != nil || len(none) != 0 {
+		t.Fatalf("RevListExcluding(base, base) = %v, %v; want empty", none, err)
+	}
+	mixed, err := repo.RevListExcluding(tip, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mixed) != 3 {
+		t.Fatalf("RevListExcluding(master, base) returned %d commits; want 3: %v", len(mixed), mixed)
+	}
+}
