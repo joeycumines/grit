@@ -325,7 +325,7 @@ func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 	src.commit("mainline feature after absorption")
 	src.push()
 
-	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	out := gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
 	if strings.Contains(out, "applying upstream:") {
 		t.Fatalf("unrelated merged history was replayed as patches:\n%s", out)
 	}
@@ -353,7 +353,7 @@ func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 		t.Fatalf("post-absorption mainline commit did not land: %q", got)
 	}
 
-	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	out = gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
 	if !strings.Contains(out, "nothing to do") {
 		t.Fatalf("absorbed history did not reach a fixed point:\n%s", out)
 	}
