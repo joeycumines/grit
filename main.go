@@ -450,7 +450,7 @@ func main() {
 	// required: a source message merely quoting another mirror's id in
 	// prose must not cause its changes to be silently dropped.
 	// We also filter out commits that match any stripped commits.
-	raw := dropForeignMergedAncestry(src, commits, srcAnchor)
+	raw := dropForeignMergedAncestry(src, commits, srcAnchor, srcBranch)
 	commits = nil
 commitsLoop:
 	for _, commit := range raw {
@@ -874,10 +874,42 @@ func applyPatch(dst, src *git.Repo, patch git.Patch, c *git.Commit, ncommit *int
 // destination never held, so replaying them corrupts drifted files, while
 // their net content arrives through the merges' own reconciliation. Internal
 // side branches, which do share history with the anchor, keep being copied
-// individually. An empty anchor revision (initial synchronization) is passed
-// through unchanged.
-func dropForeignMergedAncestry(src *git.Repo, commits []*git.Commit, srcAnchor string) []*git.Commit {
+// individually.
+//
+// Every parent of every merge is inspected: git assigns parent order from
+// the committer's checkout state at merge time, so an unrelated lineage can
+// be the FIRST parent (a foreign branch merged the mainline and was itself
+// fast-forwarded), and a foreign history can internally merge anchored side
+// branches whose shared ancestry must not mask the foreign first parent.
+// Merge reconciliation is parent-symmetric -- it unions candidate paths over
+// all parents and pins the merge's own tree -- so excluding any disjoint
+// parent loses no content. A related first parent costs one merge-base call
+// and nothing else.
+//
+// An empty anchor revision (initial synchronization) is passed through
+// unchanged: with no synchronized revision there is no reference to be
+// disjoint from -- every root is equally (un)related -- and refusing to
+// replay would mirror nothing for sources absorbed before their first sync.
+// Overlapping paths across disjoint roots pause loudly through the ordinary
+// conflict machinery; merged content still converges through reconciliation.
+//
+// An anchor sharing no history with the source branch itself (a rewritten
+// source history whose pre-rewrite digests still resolve, or similar legacy
+// state) also stands the filter down: classifying against such a reference
+// would discard legitimate mainline work. An anchor that is itself an
+// absorbed foreign commit left behind by older grit versions remains outside
+// automatic recovery and needs manual repair; grit no longer creates one,
+// because excluded commits are never applied or tagged.
+func dropForeignMergedAncestry(src *git.Repo, commits []*git.Commit, srcAnchor, srcTip string) []*git.Commit {
 	if srcAnchor == "" {
+		return commits
+	}
+	switch shared, err := src.HasCommonAncestor(srcAnchor, srcTip); {
+	case err != nil:
+		log.Fatalf("%s: merge-base between resume anchor %s and %s: %v", src, srcAnchor, srcTip, err)
+	case !shared:
+		log.Printf("resume anchor %s shares no history with source branch %s: "+
+			"skipping unrelated-history exclusion for this run", srcAnchor, srcTip)
 		return commits
 	}
 	var foreign map[string]bool
@@ -889,7 +921,7 @@ func dropForeignMergedAncestry(src *git.Repo, commits []*git.Commit, srcAnchor s
 		if len(parents) < 2 {
 			continue
 		}
-		for _, parent := range parents[1:] {
+		for _, parent := range parents {
 			shared, err := src.HasCommonAncestor(srcAnchor, parent)
 			if err != nil {
 				log.Fatalf("%s: merge-base against merged-in parent %s: %v", src, parent[:7], err)

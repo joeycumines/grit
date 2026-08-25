@@ -315,8 +315,10 @@ func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 	src.git("rm", "-rf", ".")
 	src.write("proj/upstream-legacy.txt", "v1")
 	src.commit("upstream: initial import")
+	foreignImport := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
 	src.write("proj/upstream-legacy.txt", "v2")
 	src.commit("upstream: harden legacy path")
+	foreignHarden := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
 	src.git("checkout", testBranch)
 	src.git("merge", "--allow-unrelated-histories", "--no-ff",
 		"-m", "Merge unrelated upstream history", "foreign")
@@ -326,8 +328,13 @@ func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 	src.push()
 
 	out := gritOutputStrict(t, src.gritBin, srcSpec, dstSpec)
-	if strings.Contains(out, "applying upstream:") {
-		t.Fatalf("unrelated merged history was replayed as patches:\n%s", out)
+	for _, leaked := range []struct{ digest, subject string }{
+		{foreignImport, "upstream: initial import"},
+		{foreignHarden, "upstream: harden legacy path"},
+	} {
+		if strings.Contains(out, "applying "+leaked.digest[:8]) {
+			t.Fatalf("unrelated merged history was replayed as patches: %s\n%s", leaked.subject, out)
+		}
 	}
 	dst.pull()
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
@@ -359,8 +366,258 @@ func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 	}
 }
 
-// TestGritBinaryFiles verifies binary changes in an incremental range serialize
-// as applicable binary patches; without --binary, am refuses the stub.
+// TestGritReversedUnrelatedMergeIsReconciledNotReplayed pins that the
+// absorption rule does not depend on merge parent order: git records the
+// first parent from the committer's checkout state, so absorbing via a
+// merge authored ON the unrelated branch (mainline then fast-forwarded to
+// the result) puts the foreign tip FIRST, and the exclusion must still fire.
+func TestGritReversedUnrelatedMergeIsReconciledNotReplayed(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// The absorption merge is authored on the foreign branch, making the
+	// unrelated history the FIRST parent; mainline is fast-forwarded to
+	// the result afterwards.
+	src.git("checkout", "--orphan", "foreign")
+	src.git("rm", "-rf", ".")
+	src.write("proj/upstream-legacy.txt", "v1")
+	src.commit("upstream: initial import")
+	foreignImport := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+	src.write("proj/upstream-legacy.txt", "v2")
+	src.commit("upstream: harden legacy path")
+	foreignHarden := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+	src.git("merge", "--allow-unrelated-histories", "--no-ff",
+		"-m", "Merge mainline into upstream tracking branch", testBranch)
+	src.git("checkout", testBranch)
+	src.git("merge", "--ff-only", "foreign")
+
+	src.write("proj/main-feature.txt", "F")
+	src.commit("mainline feature after reversed absorption")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	for _, leaked := range []struct{ digest, subject string }{
+		{foreignImport, "upstream: initial import"},
+		{foreignHarden, "upstream: harden legacy path"},
+	} {
+		if strings.Contains(out, "applying "+leaked.digest[:8]) {
+			t.Fatalf("unrelated merged history was replayed as patches: %s\n%s", leaked.subject, out)
+		}
+	}
+	if !strings.Contains(out, "unrelated history") {
+		t.Fatalf("exclusion of the foreign first parent was not announced:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	subjects := dst.gitOut("log", "--format=%s")
+	for _, bad := range []string{"upstream: initial import", "upstream: harden legacy path"} {
+		if strings.Contains(subjects, bad) {
+			t.Fatalf("commit from unrelated merged history was copied into the destination: %q\nall subjects:\n%s", bad, subjects)
+		}
+	}
+
+	// Exactly four commits may exist: the seed, the mirrored first
+	// commit, the merge's reconciliation, and the mainline feature. Any
+	// more means foreign lineage leaked through as individual copies.
+	if got := strings.Count(strings.TrimSpace(dst.gitOut("log", "--format=%H")), "\n") + 1; got != 4 {
+		t.Fatalf("destination carries %d commits, want exactly 4:\n%s", got, dst.gitOut("log", "--oneline"))
+	}
+	if got := dstRead(t, dst.dir, "upstream-legacy.txt"); got != "v2" {
+		t.Fatalf("merge reconciliation did not land the absorbed content: %q", got)
+	}
+	if got := dstRead(t, dst.dir, "main-feature.txt"); got != "F" {
+		t.Fatalf("post-absorption mainline commit did not land: %q", got)
+	}
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("reversed absorbed history did not reach a fixed point:\n%s", out)
+	}
+}
+
+// TestGritForeignFirstParentBehindSharedMergeIsExcluded pins that an
+// unrelated lineage is excluded even when it reaches the synced branch
+// through a foreign-side merge whose SECOND parent shares the anchor: the
+// shared second parent must not mask the disjoint first parent.
+func TestGritForeignFirstParentBehindSharedMergeIsExcluded(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// A foreign orphan lineage internally merges a side branch that DOES
+	// descend from the synced mainline; the outer merge then absorbs the
+	// foreign tip into the mainline.
+	src.git("checkout", "--orphan", "foreign")
+	src.git("rm", "-rf", ".")
+	src.write("proj/legacy-a.txt", "a1")
+	src.commit("upstream: import module")
+	foreignImport := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+	src.git("branch", "side", testBranch)
+	src.git("checkout", "side")
+	src.write("proj/side-note.txt", "s")
+	src.commit("side work on synced history")
+	src.git("checkout", "foreign")
+	src.git("merge", "--allow-unrelated-histories", "--no-ff",
+		"-m", "foreign merges side work", "side")
+	src.git("checkout", testBranch)
+	src.git("merge", "--allow-unrelated-histories", "--no-ff",
+		"-m", "absorb foreign module", "foreign")
+
+	src.write("proj/main-feature.txt", "F")
+	src.commit("mainline feature after nested absorption")
+	src.push()
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if strings.Contains(out, "applying "+foreignImport[:8]) {
+		t.Fatalf("unrelated merged history was replayed as patches:\n%s", out)
+	}
+	if !strings.Contains(out, "unrelated history") {
+		t.Fatalf("exclusion of the foreign first parent was not announced:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	subjects := dst.gitOut("log", "--format=%s")
+	if strings.Contains(subjects, "upstream: import module") {
+		t.Fatalf("commit from the unrelated lineage was copied into the destination:\n%s", subjects)
+	}
+	if !strings.Contains(subjects, "side work on synced history") {
+		t.Fatalf("anchored side branch was dropped along with the foreign history:\n%s", subjects)
+	}
+	if got := dstRead(t, dst.dir, "legacy-a.txt"); got != "a1" {
+		t.Fatalf("merge reconciliation did not land the absorbed content: %q", got)
+	}
+	if got := dstRead(t, dst.dir, "side-note.txt"); got != "s" {
+		t.Fatalf("anchored side branch content did not land: %q", got)
+	}
+	if got := dstRead(t, dst.dir, "main-feature.txt"); got != "F" {
+		t.Fatalf("post-absorption mainline commit did not land: %q", got)
+	}
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("nested absorbed history did not reach a fixed point:\n%s", out)
+	}
+}
+
+// TestGritInitialSyncConvergesAbsorbedHistory pins initial synchronization
+// semantics for a source absorbed before its first sync: with no resume
+// anchor there is no revision to be disjoint from, so every root is
+// replayed, and each merge still reconciles net content at its topological
+// position -- the mirrored tree converges exactly once either way.
+func TestGritInitialSyncConvergesAbsorbedHistory(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("mainline root")
+	src.git("checkout", "--orphan", "foreign")
+	src.git("rm", "-rf", ".")
+	src.write("proj/upstream-legacy.txt", "v1")
+	src.commit("upstream: initial import")
+	src.write("proj/upstream-legacy.txt", "v2")
+	src.commit("upstream: harden legacy path")
+	src.git("checkout", testBranch)
+	src.git("merge", "--allow-unrelated-histories", "--no-ff",
+		"-m", "Merge unrelated upstream history", "foreign")
+	src.write("proj/main-feature.txt", "F")
+	src.commit("mainline feature after absorption")
+	src.push()
+
+	gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	if got := dstRead(t, dst.dir, "upstream-legacy.txt"); got != "v2" {
+		t.Fatalf("absorbed content did not land during initial sync: %q", got)
+	}
+	if got := dstRead(t, dst.dir, "main-feature.txt"); got != "F" {
+		t.Fatalf("post-absorption mainline commit did not land: %q", got)
+	}
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("initially synchronized absorbed history did not reach a fixed point:\n%s", out)
+	}
+}
+
+// TestGritDisjointResumeAnchorSkipsExclusionFilter pins the guard for
+// resume anchors sharing no history with the current source branch (a
+// rewritten source history whose pre-rewrite digests still resolve in the
+// cached clone): classifying merges against such a reference would discard
+// legitimate side branches, so the filter stands down loudly instead.
+func TestGritDisjointResumeAnchorSkipsExclusionFilter(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.write("proj/base.txt", "v2")
+	src.commit("second commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Rebuild the source history from an orphan root so the synced anchor
+	// digest no longer precedes the branch tip while still resolving in
+	// grit's cached source clone. The rebuilt tree keeps base.txt so the
+	// mirrored subtree stays comparable across the rewrite.
+	src.git("checkout", "--orphan", "rewritten")
+	src.git("rm", "-rf", ".")
+	src.write("proj/base.txt", "v2")
+	src.write("proj/fresh.txt", "f1")
+	src.commit("rebuilt root")
+	src.git("checkout", "-b", "topic")
+	src.write("proj/topic.txt", "t1")
+	src.commit("topic work")
+	src.git("checkout", "rewritten")
+	src.git("merge", "--no-ff", "-m", "Merge branch 'topic'", "topic")
+	src.git("push", "--force", "origin", "rewritten:"+testBranch)
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "shares no history") {
+		t.Fatalf("disjoint resume anchor did not stand down the exclusion filter:\n%s", out)
+	}
+	dst.pull()
+	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
+
+	if got := dstRead(t, dst.dir, "topic.txt"); got != "t1" {
+		t.Fatalf("side branch was dropped under a disjoint resume anchor: %q", got)
+	}
+	if got := dstRead(t, dst.dir, "fresh.txt"); got != "f1" {
+		t.Fatalf("rebuilt root content did not land: %q", got)
+	}
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("rewritten history did not reach a fixed point:\n%s", out)
+	}
+}
+
+// TestGritBinaryFiles verifies that binary file changes within an
+// incremental sync range are serialized as applicable binary patches and
+// converge byte-for-byte. Without --binary, format-patch emits a
+// "Binary files differ" stub and git am refuses to apply it.
 func TestGritBinaryFiles(t *testing.T) {
 	src, dst := setupGritRepos(t)
 

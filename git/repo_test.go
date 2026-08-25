@@ -917,8 +917,8 @@ func TestHasCommonAncestorAndRevListExcluding(t *testing.T) {
 		defer cleanup()
 	}
 	shell(t, dir, `
-		git init --bare repo
-		git clone repo checkout
+		git -c init.defaultBranch=master init --bare -b master repo
+		git clone -c init.defaultBranch=master repo checkout
 		cd checkout
 		git config user.email you@example.com
 		git config user.name "your name"
