@@ -259,11 +259,11 @@ func TestPrefixPatchApply(t *testing.T) {
 	`)
 }
 
-// TestLFSPoinersBoundaryContainment pins that LFS pointer listing
+// TestLFSPointersBoundaryContainment pins that LFS pointer listing
 // treats the prefix as a directory boundary identically to patch
 // routing: sibling names that merely share the prefix's leading bytes
 // are skipped whole rather than retained and mangled by TrimPrefix.
-func TestLFSPoinersBoundaryContainment(t *testing.T) {
+func TestLFSPointersBoundaryContainment(t *testing.T) {
 	line := func(path string) string { return "* fake-oid " + path }
 	for _, tc := range []struct {
 		name   string
