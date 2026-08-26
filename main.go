@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // Grit copies commits from a source repository to a destination
-// repository. It is intended to mirror projects residing in an
+// repository. It is intended to mirror projects residing in a
 // private monorepo to an external project-specific Git repository.
 //
 // Usage:
@@ -11,7 +11,7 @@
 //	grit [-push] [-dump] [-linearize] src dst rules...
 //
 // "grit -push src dst rules..." copies commits from the repository
-// src to the repository dst, applying the the given rules and, if
+// src to the repository dst, applying the given rules and, if
 // successful, pushes the changes to the destination repository.
 // Repositories are named by url, prefix, and branch, with one of the
 // following syntaxes:
@@ -21,7 +21,7 @@
 //	url,prefix,branch
 //
 // The default prefix is "" and the default branch is "master". When a
-// prefix is specified, Grit considers constructs a view of the repository
+// prefix is specified, grit constructs a view of the repository
 // limited to the given prefix path. Changes outside of this prefix are
 // discarded.
 //
@@ -40,8 +40,7 @@
 // both ways: a competing destination-side edit on a path the merge
 // resolves is superseded rather than paused, while edits on paths the
 // merge's ancestor commits touch pause through their own application.
-// Because reconciliation enforces the merged tree's content, a
-// "-s subtree"
+// Because reconciliation enforces the merged tree's content, a "-s subtree"
 // merge whose structural relocation crosses the configured prefix is
 // out of scope: its relocated layout cannot be expressed by prefix
 // filtering alone.
@@ -59,8 +58,8 @@
 // # Incremental synchronization
 //
 // When resuming from the last synchronized source commit X, grit
-// copies every commit in X..<branch> -- including commits merged in
-// from side branches after X was synced -- and applies them in
+// copies every commit in X..<branch>, including commits merged in
+// from side branches after X was synced, and applies them in
 // topological order, so linear histories are not required for
 // correctness. Commits merged in from a history sharing no common
 // ancestor with X, such as an entire repository absorbed with "merge
@@ -724,12 +723,11 @@ commitsLoop:
 // is taken against the destination's current tree, so the corrective
 // patch converges those paths to the merged state by construction and,
 // before rewrite rules transform it, cannot itself conflict: a
-// destination-side edit on a
-// path the merge resolves is superseded rather than paused. Conflicts
-// on paths the merge's ancestor commits touch still pause loudly
-// through their own three-way application. Hand-resolved ("evil")
-// content and "-s ours" discards are both expressed this way,
-// byte-exactly.
+// destination-side edit on a path the merge resolves is superseded
+// rather than paused. Conflicts on paths the merge's ancestor commits
+// touch still pause loudly through their own three-way application.
+// Hand-resolved ("evil") content and "-s ours" discards are both
+// expressed this way, byte-exactly.
 // The returned patch is untagged: the caller decides between the merge's
 // shipit tag and a re-examinability marker after applying path rules.
 // An empty result reports a converged state: trivial merges replicate
@@ -845,14 +843,14 @@ func applyPatch(dst, src *git.Repo, patch git.Patch, c *git.Commit, ncommit *int
 // be the FIRST parent (a foreign branch merged the mainline and was itself
 // fast-forwarded), and a foreign history can internally merge anchored side
 // branches whose shared ancestry must not mask the foreign first parent.
-// Merge reconciliation is parent-symmetric -- it unions candidate paths over
-// all parents and pins the merge's own tree -- so excluding any disjoint
+// Merge reconciliation is parent-symmetric: it unions candidate paths over
+// all parents and pins the merge's own tree, so excluding any disjoint
 // parent loses no content. A related first parent costs one merge-base call
 // and nothing else.
 //
 // An empty anchor revision (initial synchronization) is passed through
 // unchanged: with no synchronized revision there is no reference to be
-// disjoint from -- every root is equally (un)related -- and refusing to
+// disjoint from (every root is equally unrelated), and refusing to
 // replay would mirror nothing for sources absorbed before their first sync.
 // Overlapping paths across disjoint roots pause loudly through the ordinary
 // conflict machinery; merged content still converges through reconciliation.
@@ -1083,12 +1081,11 @@ func (r rules) isMessagePathStripped(path string) (bool, *regexp.Regexp) {
 
 var binaryPatchMarker = []byte("GIT binary patch")
 
-// rewriteDiff applies the rulesets rewrite rules to the provided diff.
-// Diffs carrying git binary sections are never rewritten. Note that git
-// serializes NUL-free binary files as ordinary textual diffs; such
-// payloads are indistinguishable from text at this level, so rewrite
-// rules should be anchored narrowly enough that they cannot match their
-// bytes.
+// rewriteDiff applies the ruleset's rewrite rules to the provided diff.
+// Diffs carrying git binary sections are never rewritten: git
+// serializes NUL-free binary files as ordinary textual diffs. Such
+// payloads are indistinguishable from text at this level; rewrite
+// rules must therefore be anchored narrowly enough not to match them.
 func (r rules) rewriteDiff(diff *git.Diff) {
 	// The parser places binary payloads (including their "GIT binary
 	// patch" marker) in Meta and leaves Body empty; textual diffs carry

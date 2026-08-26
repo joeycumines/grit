@@ -1,15 +1,30 @@
+# Grit
+
 ![](https://github.com/grailbio/grit/workflows/CI/badge.svg)
 
-Grit copies commits from a source repository to a destination
-repository. It is intended to mirror projects residing in an
-private monorepo to an external project-specific Git repository.
-Merge commits are replicated too, including hand-resolved conflict
-content and "-s ours" discards; see the package documentation's
-"Merge commits" section for the exact semantics.
+Grit synchronizes Git repository branches, copying commits from a source
+repository to a destination repository. It is designed to mirror project
+subtrees residing in a monorepo to standalone external repositories.
 
-Usage:
+Merge commits are replicated, including hand-resolved conflict resolutions
+("evil merges"), `-s ours` discards, and octopus joins.
 
-	$ go get [-u] github.com/grailbio/grit
-	$ grit [-push] [-dump] src dst rules...
+## Installation
 
-[Documentation](https://godoc.org/github.com/grailbio/grit).
+```sh
+go install github.com/grailbio/grit@latest
+```
+
+## Usage
+
+```sh
+grit [-push] [-dump] [-linearize] <source> <destination> [rules...]
+```
+
+Repositories are specified as `url[,prefix[,branch]]`. The prefix defaults to
+`""` (repository root) and branch defaults to `master`.
+
+## Documentation
+
+See the [package documentation](https://pkg.go.dev/github.com/grailbio/grit) for
+detailed documentation on merge replication, synchronization rules, and configuration.
