@@ -294,7 +294,7 @@ func TestGritNonLinearHistoryResume(t *testing.T) {
 
 // TestGritUnrelatedMergedHistoryIsReconciledNotReplayed pins the absorption
 // rule: commits merged in from an unrelated history arrive through their
-// merge's reconciliation, never as individually replayed patches -- their
+// merge's reconciliation, never as individually replayed patches: their
 // diffs assume parent states the destination never held.
 func TestGritUnrelatedMergedHistoryIsReconciledNotReplayed(t *testing.T) {
 	src, dst := setupGritRepos(t)
@@ -520,7 +520,7 @@ func TestGritForeignFirstParentBehindSharedMergeIsExcluded(t *testing.T) {
 // semantics for a source absorbed before its first sync: with no resume
 // anchor there is no revision to be disjoint from, so every root is
 // replayed, and each merge still reconciles net content at its topological
-// position -- the mirrored tree converges exactly once either way.
+// position: the mirrored tree converges exactly once either way.
 func TestGritInitialSyncConvergesAbsorbedHistory(t *testing.T) {
 	src, dst := setupGritRepos(t)
 

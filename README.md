@@ -1,36 +1,46 @@
+# Grit
+
 ![](https://github.com/grailbio/grit/workflows/CI/badge.svg)
 
-Grit copies commits from a source repository to a destination
-repository. It is intended to mirror projects residing in an
-private monorepo to an external project-specific Git repository.
-Merge commits are replicated too, including hand-resolved conflict
-content and "-s ours" discards; see the package documentation's
-"Merge commits" section for the exact semantics.
+Grit synchronizes Git repository branches, copying commits from a source
+repository to a destination repository. It is designed to mirror project
+subtrees residing in a monorepo to standalone external repositories.
 
-Clone caches live under the OS temporary directory by default and are
-bounded automatically: every grit run sweeps entries unused for 14
-days (336 hours). Set `GRIT_CACHE_DIR` (an absolute path) to relocate
-caches to durable storage, and `GRIT_CACHE_TTL` (a Go duration) to
-change or disable (`0`) the sweep window. Clone entries holding a
-paused conflict-resolution session are never swept; other idle state
-is discarded after the window, so point `GRIT_CACHE_DIR` at durable
-storage before pausing work for longer than that.
+Merge commits are replicated, including hand-resolved conflict resolutions
+("evil merges"), `-s ours` discards, and octopus joins.
+
+## Installation
+
+```sh
+go install github.com/grailbio/grit@latest
+```
+
+## Usage
+
+```sh
+grit [-push] [-dump] [-linearize] <source> <destination> [rules...]
+```
+
+Repositories are specified as `url[,prefix[,branch]]`. The prefix defaults to
+`""` (repository root) and branch defaults to `master`.
+
+## Cache Management
+
+Clone caches reside in the operating system temporary directory by default and
+are swept automatically: entries unused for 14 days (336 hours) are removed.
+Set `GRIT_CACHE_DIR` to an absolute path to relocate caches to persistent
+storage, and `GRIT_CACHE_TTL` to modify or disable (`0`) the sweep window.
+Paused conflict-resolution sessions are never swept.
 
 ## Concurrency
 
-Run one grit process per source/destination pair. On a single host,
-a per-endpoint flock in the clone cache serializes concurrent runs
-against the same destination, except in the narrow window where the
-cache sweep removes a stale entry just as another run reopens it; a
-run that hits that window fails loudly and a rerun recovers. Across hosts (no shared filesystem),
-concurrent pushes to the same destination branch race: the loser's
-push is rejected as non-fast-forward and its local state is discarded,
-so simply re-running the losing grit recomputes against the updated
-destination.
+Run one grit process per source/destination pair. On a single host, a
+per-endpoint lock in the clone cache serializes concurrent runs against the
+same destination. Across hosts without a shared filesystem, competing pushes
+to the same destination branch fail non-fast-forward; grit discards its local
+state on rejection, and rerunning recomputes against the updated destination tip.
 
-Usage:
+## Documentation
 
-	$ go get [-u] github.com/grailbio/grit
-	$ grit [-push] [-dump] src dst rules...
-
-[Documentation](https://godoc.org/github.com/grailbio/grit).
+See the [package documentation](https://pkg.go.dev/github.com/grailbio/grit) for
+detailed documentation on merge replication, synchronization rules, and configuration.

@@ -598,8 +598,8 @@ func (r *Repo) Linearize() error {
 }
 
 // Configure sets the configuration parameter named by key to
-// the value value. Properties configured this way overrides the
-// Git's defaults (e.g., sourced through a user's .gitconfig) for
+// the value value. Properties configured this way override
+// Git's defaults (for example, sourced through a user's .gitconfig) for
 // repo Git invocations.
 func (r *Repo) Configure(key, value string) {
 	if r.config == nil {
@@ -678,8 +678,8 @@ var (
 	prefixB = []byte("+++ b/")
 )
 
-// Patch returns a patch representing the commit named by the provided ID.  Arg
-// dstPrefix is the prefix of the destination repository. If dstPrefix!="", it
+// Patch returns a patch representing the commit named by the provided ID. Arg
+// dstPrefix is the prefix of the destination repository. If dstPrefix!="",
 // it is prepended to the pathnames in the patch.
 func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 	// To minimize the amount of parsing we have to do here, first get the
@@ -875,7 +875,7 @@ func (r *Repo) Push(remote, remoteBranch string) error {
 	return err
 }
 
-// ListLFSPointers returns paths to in the repository which are LFS
+// ListLFSPointers returns paths in the repository which are LFS
 // pointers. The paths are relative to the repository's root.
 func (r *Repo) ListLFSPointers() (pointers []string, err error) {
 	lines, err := r.git(nil, "lfs", "ls-files")
@@ -1061,7 +1061,7 @@ func (c *Commit) String() string {
 	return fmt.Sprintf("%s: %s", c.Digest.Short(), c.Title())
 }
 
-// Title returns the commit's title -- the first line of its body.
+// Title returns the commit's title (the first line of its body).
 func (c *Commit) Title() string {
 	return strings.SplitN(c.Body, "\n", 2)[0]
 }
