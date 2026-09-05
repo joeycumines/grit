@@ -1,6 +1,8 @@
+> This is a maintained fork of [Grit](https://github.com/grailbio/grit).
+
 # Grit
 
-![](https://github.com/grailbio/grit/workflows/CI/badge.svg)
+![](https://github.com/joeycumines/grit/workflows/CI/badge.svg)
 
 Grit synchronizes Git repository branches, copying commits from a source
 repository to a destination repository. It is designed to mirror project
@@ -12,7 +14,7 @@ Merge commits are replicated, including hand-resolved conflict resolutions
 ## Installation
 
 ```sh
-go install github.com/grailbio/grit@latest
+go install github.com/joeycumines/grit@latest
 ```
 
 ## Usage
@@ -42,5 +44,5 @@ state on rejection, and rerunning recomputes against the updated destination tip
 
 ## Documentation
 
-See the [package documentation](https://pkg.go.dev/github.com/grailbio/grit) for
+See the [package documentation](https://pkg.go.dev/github.com/joeycumines/grit) for
 detailed documentation on merge replication, synchronization rules, and configuration.

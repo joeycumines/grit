@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/grailbio/grit/git"
+	"github.com/joeycumines/grit/git"
 )
 
 func TestIsProcessed(t *testing.T) {

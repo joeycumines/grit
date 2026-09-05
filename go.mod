@@ -1,6 +1,6 @@
-module github.com/grailbio/grit
+module github.com/joeycumines/grit
 
-go 1.27.0
+go 1.27.1
 
 require (
 	github.com/grailbio/base v0.0.11

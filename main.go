@@ -147,7 +147,7 @@ import (
 	"strings"
 
 	"github.com/grailbio/base/log"
-	"github.com/grailbio/grit/git"
+	"github.com/joeycumines/grit/git"
 )
 
 func usage() {

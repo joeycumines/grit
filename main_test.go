@@ -192,7 +192,7 @@ type grit string
 
 func (g *grit) Build(t *testing.T) {
 	t.Helper()
-	*g = grit(testutil.GoExecutable(t, "//go/src/github.com/grailbio/grit/grit"))
+	*g = grit(testutil.GoExecutable(t, "//go/src/github.com/joeycumines/grit/grit"))
 }
 
 func (g grit) Run(t *testing.T, arg ...string) {

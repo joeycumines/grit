@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	gritgit "github.com/grailbio/grit/git"
+	gritgit "github.com/joeycumines/grit/git"
 )
 
 var regexpFullDigest = regexp.MustCompile(`fbshipit-source-id: [0-9a-f]{40}`)
