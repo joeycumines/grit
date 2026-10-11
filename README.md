@@ -20,11 +20,36 @@ go install github.com/joeycumines/grit@latest
 ## Usage
 
 ```sh
-grit [-push] [-dump] [-linearize] <source> <destination> [rules...]
+grit [-push] [-dump] [-linearize] [-resolve-empty] <source> <destination> [rules...]
 ```
 
 Repositories are specified as `url[,prefix[,branch]]`. The prefix defaults to
 `""` (repository root) and branch defaults to `master`.
+
+When a paused, single-patch tagged conflict should make no destination content
+changes, restore every tracked change from the attempted patch to `HEAD`,
+including paths that merged cleanly, so both the index and tracked worktree
+match `HEAD`. For example, use
+`git -C <clone> restore --source=HEAD --staged --worktree -- <paths>` for all
+tracked paths changed by the attempt, including paths that merged cleanly.
+Then rerun the same command with `-resolve-empty`. New paused sessions are
+bound to the source and destination specs, rules, `-config` values, and
+linearization setting used to create them. The flag refuses a changed
+configuration, unmerged paths, untagged patches, a moved `HEAD`, or any
+staged or unstaged tracked changes. For older paused sessions without saved
+configuration, Grit can verify source-commit ancestry but warns that it cannot
+check the original prefix or rules. Untracked files are not part of this check.
+
+Grit records an empty commit carrying the paused source patch's synchronization
+tag and resumes processing in that invocation. With `-push`, it pushes on
+success; without `-push`, the commits remain local in the destination cache
+until a later invocation pushes them. A later conflict pauses again.
+
+Genuinely empty source commits (or commits with no applicable diffs after
+prefixes and rules) are skipped and are not copied as empty destination
+commits. A later applied, tagged commit whose ancestry includes them advances
+the synchronization anchor past them; trailing empty commits alone do not
+advance it.
 
 ## Cache Management
 

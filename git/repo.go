@@ -22,6 +22,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -288,9 +289,9 @@ func (r *Repo) openLocked() (*Repo, error) {
 	}
 	// Capture the remote tip now: any later fetch (e.g. object seeding)
 	// overwrites FETCH_HEAD, and nothing re-reads FETCH_HEAD afterwards
-	// (ResetToRemote uses this snapshot), so the overwrite is harmless,
-	// which keeps grit compatible with git versions lacking
-	// --no-write-fetch-head.
+	// (the originHead snapshot serves the preservation gate below and
+	// main's push-time gate), so the overwrite is harmless, which keeps
+	// grit compatible with git versions lacking --no-write-fetch-head.
 	originHead, err := r.RevParse("FETCH_HEAD")
 	if err != nil {
 		return nil, err
@@ -372,15 +373,18 @@ func (r *Repo) InProgressAM() (bool, error) {
 }
 
 // IsAncestor reports whether ancestor is equal to or an ancestor of
-// descendant. Both digests must resolve; with valid revisions, a
-// merge-base failure can only mean that the two commits are unrelated,
-// which is not ancestry. (A transient git failure would also map to
-// "not ancestor"; the consequence is a preserved tree and a later push,
-// never data loss.)
+// descendant. A merge-base exit status 1 means the two commits are
+// unrelated, which is not ancestry; every other git failure (bad
+// revision, transient error) is returned, so callers cannot mistake a
+// broken read for a clean negative and discard state on its strength.
 func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
 	out, err := r.git(nil, "merge-base", ancestor, descendant)
 	if err != nil {
-		return false, nil
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
 	}
 	return strings.TrimSpace(string(out)) == ancestor, nil
 }
@@ -487,10 +491,19 @@ func (c *Commit) OwnLineConvergenceMarkers() []string {
 func (r *Repo) PreservedTailIsGritAuthored(originHead string) (bool, error) {
 	mbOut, err := r.git(nil, "merge-base", originHead, "HEAD")
 	if err != nil {
-		// Between valid revisions a merge-base failure means unrelated
-		// histories (the reading IsAncestor documents); nothing local
-		// descends from the remote tip.
-		return false, nil
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			// Unrelated histories: nothing local descends from the
+			// remote tip.
+			return false, nil
+		}
+		if _, rerr := r.git(nil, "cat-file", "-e", originHead); rerr != nil {
+			// The tip object is absent here (never fetched): nothing
+			// local can descend from it, so this is disjointness, not
+			// a failure worth surfacing.
+			return false, nil
+		}
+		return false, err
 	}
 	if mb := strings.TrimSpace(string(mbOut)); mb != originHead {
 		return false, nil
@@ -533,13 +546,13 @@ func (r *Repo) HeadEntry(path string) (digest, mode string, err error) {
 	// :(literal) disables pathspec globbing so metacharacters in file
 	// names cannot alias sibling entries; tree reads are case-exact and
 	// reflect committed state only.
-	out, err := r.git(nil, "ls-tree", "HEAD", "--", ":(literal)"+path)
+	out, err := r.git(nil, "ls-tree", "-z", "HEAD", "--", ":(literal)"+path)
 	if err != nil {
 		return "", "", err
 	}
 	var lines []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.TrimSpace(line) != "" {
+	for _, line := range strings.Split(string(out), "\x00") {
+		if line != "" {
 			lines = append(lines, line)
 		}
 	}
@@ -591,7 +604,11 @@ func (r *Repo) Close() error {
 	return r.lock.Unlock()
 }
 
-// Linearize linearizes the repository's history.
+// Linearize linearizes the repository's history. The parent filter keeps
+// the first parent only: filter-branch feeds the filter "-p <sha> -p <sha>
+// ..." with a leading space, so fields 2 and 3 of the space split are the
+// first "-p <sha>" pair (verified live on git 2.56.0; merges collapse to
+// their first parent and single-parent commits keep theirs).
 func (r *Repo) Linearize() error {
 	_, err := r.git(nil, "filter-branch", "-f", "--parent-filter", `cut -f 2,3 -d " "`)
 	return err
@@ -611,9 +628,9 @@ func (r *Repo) Configure(key, value string) {
 // Log returns a set of commit objects representing the "git log" operation
 // with the provided arguments, restricted to the repository's path prefix.
 func (r *Repo) Log(args ...string) (commits []*Commit, err error) {
-	args = append([]string{"log"}, args...)
+	args = append([]string{"log", "--pretty=medium", "--no-decorate"}, args...)
 	if r.prefix != "" {
-		args = append(args, r.prefix)
+		args = append(args, "--", r.prefix)
 	}
 	out, err := r.git(nil, args...)
 	if err != nil {
@@ -637,7 +654,7 @@ func (r *Repo) Log(args ...string) (commits []*Commit, err error) {
 // ids) must be read through this method: worktree-dependent pathspecs
 // would silently empty it when the prefix subtree is absent.
 func (r *Repo) LogIgnoringPrefix(args ...string) ([]*Commit, error) {
-	out, err := r.git(nil, append([]string{"log"}, args...)...)
+	out, err := r.git(nil, append([]string{"log", "--pretty=medium", "--no-decorate"}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -711,7 +728,12 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 		return Patch{}, fmt.Errorf("parse patch %v: %v", id, err)
 	}
 
-	err = foreach(rawdiffs, "diff", func(diff []byte) error {
+	// Split on the full header: bare base85 binary-payload lines can start
+	// with "diff" (no space in the payload alphabet), so the short prefix
+	// would false-split inside binary sections and fail loudly downstream.
+	// The trailing space is critical: base85 cannot encode a space, so
+	// "diff --git " cannot appear mid-payload.
+	err = foreach(rawdiffs, "diff --git ", func(diff []byte) error {
 		header := scanLine(&diff)
 		path := parseDiffHeader(header)
 		if path == nil {
@@ -730,7 +752,7 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 		// leaves "/f.txt"); destination paths must be relative, whatever
 		// spelling the source prefix used.
 		rest := strings.TrimPrefix(p, r.prefix)
-		return dstPrefix + strings.TrimPrefix(rest, "/")
+		return joinDst(dstPrefix, strings.TrimPrefix(rest, "/"))
 	}
 
 	var diffs []Diff
@@ -753,6 +775,29 @@ func (r *Repo) Patch(id digest.Digest, dstPrefix string) (Patch, error) {
 	return patch, nil
 }
 
+// scanQuotedEnd returns the length of the leading C-quoted string in s
+// (opening quote through closing quote), or -1 when unterminated. An odd
+// run of backslashes before a quote leaves it escaped; only an unescaped
+// quote terminates the scan.
+func scanQuotedEnd(s string) int {
+	if len(s) == 0 || s[0] != '"' {
+		return -1
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		bs := 0
+		for j := i - 1; j >= 1 && s[j] == '\\'; j-- {
+			bs++
+		}
+		if bs%2 == 0 {
+			return i + 1
+		}
+	}
+	return -1
+}
+
 // rewriteDiffMeta rewrites the a/ and b/ pathnames inside a diff's
 // metadata section through fixPath, reproducing every other line
 // byte-for-byte, including per-line trailing carriage returns, which
@@ -769,28 +814,66 @@ func rewriteDiffMeta(meta []byte, fixPath func(string) string) []byte {
 		}
 		switch {
 		case bytes.HasPrefix(line, prefixA):
-			out = append(out, prefixA...)
-			out = append(out, fixPath(string(line[len(prefixA):]))...)
+			// Unquoted form: `--- a/P`<suffix>. Git appends a tab plus
+			// timestamp suffix on some outputs; only the path portion is
+			// rewritten, mirroring the C-quoted branch below. When the
+			// rewritten path gains quoting triggers, the line is promoted
+			// to C-quoted form, mirroring Patch.Write's gate: git
+			// rejects raw control bytes in unquoted headers.
+			rest := string(line[len(prefixA):])
+			path, suffix, _ := strings.Cut(rest, "\t")
+			fixed := fixPath(path)
+			sfx := ""
+			if strings.Contains(rest, "\t") {
+				sfx = "\t" + suffix
+			}
+			if strings.ContainsAny(fixed, "\"\\\t\n\r") || hasControlChars(fixed) {
+				out = append(out, []byte(`--- `+quotePath("a/"+fixed))...)
+			} else {
+				out = append(out, prefixA...)
+				out = append(out, fixed...)
+			}
+			out = append(out, sfx...)
 		case bytes.HasPrefix(line, prefixB):
-			out = append(out, prefixB...)
-			out = append(out, fixPath(string(line[len(prefixB):]))...)
+			rest := string(line[len(prefixB):])
+			path, suffix, _ := strings.Cut(rest, "\t")
+			fixed := fixPath(path)
+			sfx := ""
+			if strings.Contains(rest, "\t") {
+				sfx = "\t" + suffix
+			}
+			if strings.ContainsAny(fixed, "\"\\\t\n\r") || hasControlChars(fixed) {
+				out = append(out, []byte(`+++ `+quotePath("b/"+fixed))...)
+			} else {
+				out = append(out, prefixB...)
+				out = append(out, fixed...)
+			}
+			out = append(out, sfx...)
 		case bytes.HasPrefix(line, []byte(`--- "a/`)), bytes.HasPrefix(line, []byte(`+++ "b/`)):
-			// C-quoted form: `--- "a/P"` / `+++ "b/P"`. The escaped
-			// path is decoded, rewritten, and re-emitted in git's exact
-			// quoting grammar.
-			escaped := strings.TrimSuffix(string(line[7:]), `"`)
-			unquoted, err := strconv.Unquote(`"` + escaped + `"`)
+			// C-quoted form: `--- "a/P"<suffix>` / `+++ "b/P"<suffix>`.
+			// The escaped path is decoded, rewritten, and re-emitted in
+			// git's exact quoting grammar; any suffix past the closing
+			// quote (tab plus timestamp) is preserved byte-for-byte.
+			rest := string(line[4:])
+			end := scanQuotedEnd(rest)
+			if end < 0 {
+				out = append(out, line...)
+				break
+			}
+			unquoted, err := strconv.Unquote(rest[:end])
 			if err != nil {
 				out = append(out, line...)
 				break
 			}
+			suffix := rest[end:]
 			side := "a"
 			if bytes.HasPrefix(line, []byte("+++")) {
 				side = "b"
 			}
-			fixed := fixPath(unquoted)
+			fixed := fixPath(strings.TrimPrefix(unquoted, side+"/"))
 			out = append(out, line[:4]...)
 			out = append(out, []byte(quotePath(side+"/"+fixed))...)
+			out = append(out, suffix...)
 		default:
 			out = append(out, line...)
 		}
@@ -852,22 +935,18 @@ func (r *Repo) PrefixEverExisted(prefix string) (bool, error) {
 	return count > 0, nil
 }
 
-// ResetToRemote discards all local state in favor of the remote tip as
-// of the most recent Open (the originHead snapshot; a third-party push
-// after Open is picked up by the next run). Used after a failed push: a
-// non-fast-forward rejection means the destination advanced
-// independently, and any locally applied commits were built on a stale
-// base.
-func (r *Repo) ResetToRemote() error {
-	_, _ = r.git(nil, "am", "--abort")
-	_, err := r.git(nil, "reset", "--hard", r.originHead)
+// ResetToCommit hard-resets the repository to the provided commit without
+// touching any am session state. Used to roll back a just-applied patch
+// when a post-commit step fails, so the source commit stays unprocessed.
+func (r *Repo) ResetToCommit(commit string) error {
+	_, err := r.git(nil, "reset", "--hard", commit)
 	return err
 }
 
 // Push pushes the current state of the repository to the provided
 // branch on the provided remote.
 func (r *Repo) Push(remote, remoteBranch string) error {
-	_, err := r.git(nil, "lfs", "push", "origin", remoteBranch)
+	_, err := r.git(nil, "lfs", "push", remote, remoteBranch)
 	if err != nil {
 		return err
 	}
@@ -897,11 +976,17 @@ func lfsPointers(listing []byte, prefix string) (pointers []string, err error) {
 		if len(line) == 0 {
 			continue
 		}
-		parts := bytes.Fields(line)
-		if len(parts) != 3 {
+		// The pathname is everything after the first two whitespace
+		// fields (oid and marker): it may itself contain spaces, so it
+		// must not be split further.
+		fields := bytes.Fields(line)
+		if len(fields) < 3 {
 			return nil, fmt.Errorf("malformed git lfs ls-files output %q", line)
 		}
-		path := string(parts[2])
+		rest := bytes.TrimPrefix(line, fields[0])
+		rest = bytes.TrimLeft(rest, " \t")
+		rest = bytes.TrimPrefix(rest, fields[1])
+		path := string(bytes.TrimLeft(rest, " \t"))
 		if !pathInPrefix(path, prefix) {
 			log.Debug.Printf("skipping LFS file %s: not in repo's prefix %s", path, prefix)
 			continue
@@ -997,9 +1082,9 @@ func (r *Repo) gitIO(stdin io.Reader, stdout io.Writer, arg ...string) error {
 
 func (r *Repo) gitIOEnv(env []string, stdin io.Reader, stdout io.Writer, arg ...string) error {
 	args := []string{"-C", r.root}
-	for k, v := range r.config {
+	for _, k := range sortedKeys(r.config) {
 		args = append(args, "-c")
-		args = append(args, k+"="+v)
+		args = append(args, k+"="+r.config[k])
 	}
 	args = append(args, arg...)
 	cmd := exec.Command("git", args...)
@@ -1025,6 +1110,17 @@ func (r *Repo) gitIOEnv(env []string, stdin io.Reader, stdout io.Writer, arg ...
 	}
 	log.Debug.Printf("%s: git %s: ok%s", r.root, strings.Join(arg, " "), outerr)
 	return nil
+}
+
+// sortedKeys returns the map's keys in ascending order, so that -c flag
+// emission order is deterministic across runs.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // Header is a commit header.

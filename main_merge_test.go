@@ -475,9 +475,12 @@ func TestGritBidirectionalFixedPoint(t *testing.T) {
 		t.Fatalf("fixed-point run applied commits:\n%s", out)
 	}
 
+	// --git-dir rather than -C: -C discovers the repository implicitly,
+	// which safe.bareRepository=explicit rejects for bare repositories;
+	// the explicit form is always permitted.
 	bareTree := func(bare, rev string) string {
 		t.Helper()
-		out, err := exec.Command("git", "-C", bare,
+		out, err := exec.Command("git", "--git-dir", bare,
 			"rev-parse", rev).CombinedOutput()
 		if err != nil {
 			t.Fatalf("rev-parse %s in %s: %v\n%s", rev, bare, err, out)
@@ -488,8 +491,8 @@ func TestGritBidirectionalFixedPoint(t *testing.T) {
 	srcTree := bareTree(src.bare, testBranch+":proj")
 	dstTree := bareTree(dst.bare, testBranch+"^{tree}")
 	if srcTree != dstTree {
-		srcRaw, _ := exec.Command("git", "-C", src.bare, "cat-file", "-p", srcTree).CombinedOutput()
-		dstRaw, _ := exec.Command("git", "-C", dst.bare, "cat-file", "-p", dstTree).CombinedOutput()
+		srcRaw, _ := exec.Command("git", "--git-dir", src.bare, "cat-file", "-p", srcTree).CombinedOutput()
+		dstRaw, _ := exec.Command("git", "--git-dir", dst.bare, "cat-file", "-p", dstTree).CombinedOutput()
 		t.Fatalf("bare remotes diverged: src %s:proj=%s dst main^tree=%s\nsrc raw:\n%s\ndst raw:\n%s",
 			testBranch, srcTree, dstTree, srcRaw, dstRaw)
 	}

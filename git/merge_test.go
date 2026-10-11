@@ -679,3 +679,180 @@ func hashObject(t *testing.T, dir, content string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+func TestJoinDst(t *testing.T) {
+	for _, tc := range []struct{ prefix, rel, want string }{
+		{"", "f.txt", "f.txt"},
+		{"", "", ""},
+		{"d/", "f.txt", "d/f.txt"},
+		{"d", "f.txt", "d/f.txt"},
+		{"d", "", "d"},
+		{"a/b", "c/d.txt", "a/b/c/d.txt"},
+	} {
+		if got := joinDst(tc.prefix, tc.rel); got != tc.want {
+			t.Errorf("joinDst(%q,%q) = %q, want %q", tc.prefix, tc.rel, got, tc.want)
+		}
+	}
+}
+
+func TestMergeChangesetSlashlessDstPrefix(t *testing.T) {
+	f := newMergeFixture(t, "proj/")
+	head := f.head()
+	parents, err := f.repo.Parents(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, removals, err := f.repo.MergeChangeset(head, parents, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removals) != 0 {
+		t.Fatalf("removals = %v, want none", removals)
+	}
+	got := map[string]bool{}
+	for _, e := range entries {
+		got[e.Path] = true
+	}
+	for _, want := range []string{"d/f.txt", "d/g.txt"} {
+		if !got[want] {
+			t.Errorf("entries missing %q: %v", want, got)
+		}
+	}
+	for p := range got {
+		if !strings.HasPrefix(p, "d/") {
+			t.Errorf("entry %q not under destination prefix d/", p)
+		}
+	}
+}
+
+func TestDesiredTreeFileDirTransitions(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init --bare origin.git
+		git clone origin.git master
+		cd master
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo filecontent > a
+		mkdir keep dd
+		echo keep > keep/k.txt
+		echo old > dd/old.txt
+		git add .
+		git commit -m'base'
+	`)
+	r := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "master"),
+		prefix: "", branch: "master"}
+	newBlob := hashObject(t, dir, "nested\n")
+	tree, err := r.DesiredTree(
+		[]TreeEntry{{Path: "a/b.txt", Mode: "100644", Blob: newBlob}},
+		[]string{"a"})
+	if err != nil {
+		t.Fatalf("file->dir transition: %v", err)
+	}
+	out, err := exec.Command("git", "-C", filepath.Join(dir, "master"), "ls-tree", "-r", "--name-only", tree).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ls-tree: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "a/b.txt") {
+		t.Fatalf("transition tree missing a/b.txt:\n%s", out)
+	}
+	r2 := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "master"),
+		prefix: "", branch: "master"}
+	dirBlob := hashObject(t, dir, "asfile\n")
+	tree2, err := r2.DesiredTree(
+		[]TreeEntry{{Path: "dd", Mode: "100644", Blob: dirBlob}},
+		[]string{"dd/old.txt"})
+	if err != nil {
+		t.Fatalf("dir->file transition: %v", err)
+	}
+	out2, err := exec.Command("git", "-C", filepath.Join(dir, "master"), "ls-tree", "-r", "--name-only", tree2).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ls-tree tree2: %v\n%s", err, out2)
+	}
+	var sawFile bool
+	for _, name := range strings.Split(strings.TrimSpace(string(out2)), "\n") {
+		if strings.HasPrefix(name, "dd/") {
+			t.Fatalf("removed directory entry survived dir->file transition: %s", name)
+		}
+		if name == "dd" {
+			sawFile = true
+		}
+	}
+	if !sawFile {
+		t.Fatalf("dir->file transition tree missing dd:\n%s", out2)
+	}
+}
+
+func TestDesiredTreeDashLeadingRemoval(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init --bare origin.git
+		git clone origin.git master
+		cd master
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo x > ./-dash.txt
+		echo y > normal.txt
+		git add .
+		git commit -m'base'
+	`)
+	r := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "master"),
+		prefix: "", branch: "master"}
+	tree, err := r.DesiredTree(nil, []string{"-dash.txt"})
+	if err != nil {
+		t.Fatalf("dash-leading removal: %v", err)
+	}
+	out, err := exec.Command("git", "-C", filepath.Join(dir, "master"), "ls-tree", "-r", "--name-only", tree).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ls-tree: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "-dash.txt") {
+		t.Fatalf("removed path survived:\n%s", out)
+	}
+}
+
+func TestDesiredTreeLiteralMagicRemoval(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init --bare origin.git
+		git clone origin.git master
+		cd master
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo magic > './star*.txt'
+		echo plain > a.txt
+		git add .
+		git commit -m'base'
+	`)
+	r := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "master"),
+		prefix: "", branch: "master"}
+	tree, err := r.DesiredTree(nil, []string{"star*.txt"})
+	if err != nil {
+		t.Fatalf("magic removal: %v", err)
+	}
+	out, err := exec.Command("git", "-C", filepath.Join(dir, "master"), "ls-tree", "-r", "--name-only", tree).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ls-tree: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "star*.txt") {
+		t.Fatalf("magic path survived removal:\n%s", out)
+	}
+	if !strings.Contains(string(out), "a.txt") {
+		t.Fatalf("sibling lost in magic removal:\n%s", out)
+	}
+}

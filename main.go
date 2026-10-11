@@ -8,7 +8,7 @@
 //
 // Usage:
 //
-//	grit [-push] [-dump] [-linearize] src dst rules...
+//	grit [-push] [-dump] [-linearize] [-resolve-empty] src dst rules...
 //
 // "grit -push src dst rules..." copies commits from the repository
 // src to the repository dst, applying the given rules and, if
@@ -139,7 +139,6 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
 	"os"
@@ -166,12 +165,13 @@ func main() {
 	push := flag.Bool("push", false, "push applied changes to the destination repository's remote")
 	configs := flag.String("config", "", "comma-separated key-value pairs that should be passed to git")
 	linearize := flag.Bool("linearize", false, "rewrite the cached source clone to a single-parent history before copying commits; the source repository is left untouched")
+	resolveEmpty := flag.Bool("resolve-empty", false, "record a paused tagged Grit patch as empty after staging a no-op resolution")
 	flag.Usage = usage
 	flag.Parse()
 	if flag.NArg() < 2 {
 		flag.Usage()
 	}
-	if *push && *dump {
+	if (*push || *resolveEmpty) && *dump {
 		flag.Usage()
 	}
 	srcURL, srcPrefix, srcBranch, err := parseSpec(flag.Arg(0))
@@ -234,6 +234,11 @@ func main() {
 		}
 	}
 
+	pausedContextID := pausedAMContextID(
+		srcURL, srcPrefix, srcBranch, dstURL, dstPrefix, dstBranch,
+		*linearize, *configs, flag.Args()[2:],
+	)
+
 	// Bound clone cache growth before any repository opens: stale
 	// entries are removed here, and entries this run goes on to open
 	// were either fresh enough to survive the sweep or are rebuilt in
@@ -278,6 +283,13 @@ func main() {
 		}
 	}
 
+	if *resolveEmpty {
+		if err := dst.ResolveEmptyAM(src, pausedContextID); err != nil {
+			log.Fatalf("resolve paused patch as empty: %v", err)
+		}
+		log.Print("empty synchronization commit is in place for the paused patch")
+	}
+
 	// A paused session takes priority over everything else: selection
 	// and convergence pruning must not make decisions while resolution
 	// is outstanding. Dump mode applies nothing, pushes nothing, and
@@ -292,7 +304,11 @@ func main() {
 			log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
 			log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
 			log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
-			log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
+			log.Printf("  no-op:     for a tagged patch, restore all tracked changes to HEAD, then re-run with -resolve-empty")
+			log.Printf("             use the same source, destination, config, rules, and linearize setting")
+			log.Printf("             untagged patches cannot use this option; it refuses tracked changes")
+			log.Printf("             that invocation resumes processing; -push pushes on success")
+			log.Printf("  regular:   after resolving with git am --continue, re-run this grit command")
 			log.Fatalf("session for this source/destination configuration is paused")
 		}
 	}
@@ -369,11 +385,12 @@ func main() {
 			log.Printf("anchor records unresolvable source id(s) %v; ignoring for resume", anchorIDs)
 			head = last[0].Digest.Hex() + "^"
 			if _, err := dst.RevParse(head); err != nil {
-				log.Fatalf("anchor walk reached tagged root commit %s with no parent; the oldest recorded shipit id cannot be matched against the source -- retag or rewrite destination history to repair", last[0])
+				log.Printf("anchor walk reached tagged root commit %s with no parent; falling through to initial synchronization", last[0])
+				break
 			}
 			continue
 		}
-		applies, err := rules.isCommitApplicable(last[0], dst)
+		applies, err := rules.isCommitApplicable(last[0], dst, dst.Prefix())
 		if err != nil {
 			log.Fatalf("isCommitApplicable %s: %v", last[0], err)
 		}
@@ -393,7 +410,8 @@ func main() {
 		log.Printf("commit %s is not applicable to %s: skipping", last[0], dst)
 		head = last[0].Digest.Hex() + "^"
 		if _, err := dst.RevParse(head); err != nil {
-			log.Fatalf("anchor walk reached tagged root commit %s with no parent; the oldest recorded shipit id cannot be matched against the source -- retag or rewrite destination history to repair", last[0])
+			log.Printf("anchor walk reached tagged root commit %s with no parent; falling through to initial synchronization", last[0])
+			break
 		}
 	}
 	var commits []*git.Commit
@@ -579,7 +597,7 @@ commitsLoop:
 				}
 				continue
 			}
-			applyPatch(dst, src, patch, c, &ncommit)
+			applyPatch(dst, src, patch, c, &ncommit, pausedContextID)
 			continue
 		}
 		patch, err := src.Patch(c.Digest, dst.Prefix())
@@ -648,7 +666,7 @@ commitsLoop:
 				newBlob, ok := diff.NewBlob()
 				if ok {
 					curBlob, curMode, err := dst.HeadEntry(diff.Path)
-					if err == nil && curBlob == newBlob {
+					if err == nil && (curBlob == newBlob || (isZeroBlob(curBlob) && isZeroBlob(newBlob))) {
 						if newMode, ok := diff.NewMode(); !ok || newMode == curMode {
 							log.Printf("skipping converged %s in %s", diff.Path, c)
 							continue
@@ -702,7 +720,7 @@ commitsLoop:
 			}
 			continue
 		}
-		applyPatch(dst, src, patch, c, &ncommit)
+		applyPatch(dst, src, patch, c, &ncommit, pausedContextID)
 	}
 	if nskipped > 0 {
 		log.Printf("%d commits skipped as already converged", nskipped)
@@ -737,273 +755,30 @@ commitsLoop:
 	}
 	log.Printf("pushing changes to %s %s", dstURL, dstBranch)
 	if err := dst.Push("origin", dstBranch); err != nil {
-		// A rejected push means the destination advanced
-		// independently of this run's base. Discard the diverged local
-		// state: the next run re-selects against the destination's
-		// actual tip, and convergence pruning re-derives whatever is
-		// still needed.
-		if rerr := dst.ResetToRemote(); rerr != nil {
-			log.Printf("reset after failed push also failed: %v", rerr)
-		} else {
-			log.Printf("discarded local state after failed push; re-run this command to recompute against the destination's current tip")
-		}
+		// The local state is left intact: a push can fail for reasons
+		// that say nothing about divergence (LFS upload, auth, network,
+		// server hooks), and discarding it here would destroy the only
+		// copy of manually resolved work. The next run re-opens against
+		// the destination's actual tip and its preservation gate decides
+		// what survives; a genuine non-fast-forward stays recoverable in
+		// this cache until then.
 		log.Fatalf("%s: push origin %s: %v", dst, dstBranch, err)
 	}
 }
 
-// reconcilePatch derives the corrective patch replicating merge m's net
-// effect at its topological position, where every ancestor change has
-// already been applied to the destination. The desired state is the
-// merge's own tree restricted to the paths the merge touched within the
-// source prefix, relocated under the destination prefix. The difference
-// is taken against the destination's current tree, so the corrective
-// patch converges those paths to the merged state by construction and,
-// before rewrite rules transform it, cannot itself conflict: a
-// destination-side edit on a path the merge resolves is superseded
-// rather than paused. Conflicts on paths the merge's ancestor commits
-// touch still pause loudly through their own three-way application.
-// Hand-resolved ("evil") content and "-s ours" discards are both
-// expressed this way, byte-exactly.
-// The returned patch is untagged: the caller decides between the merge's
-// shipit tag and a re-examinability marker after applying path rules.
-// An empty result reports a converged state: trivial merges replicate
-// nothing and take no tag.
-func reconcilePatch(src, dst *git.Repo, m *git.Commit) (git.Patch, bool, error) {
-	commits, err := src.LogIgnoringPrefix("-1", "--date=rfc2822", m.Digest.Hex())
-	if err != nil {
-		return git.Patch{}, false, err
+// isZeroBlob reports whether the digest is a zero blob of any hash length:
+// absent paths read back as zeros, and deletions record zeros whose width
+// follows the repository's hash function (40 hex for SHA-1, 64 for SHA-256).
+func isZeroBlob(blob string) bool {
+	if blob == "" {
+		return false
 	}
-	if len(commits) != 1 {
-		return git.Patch{}, false, fmt.Errorf("log -1 %s returned %d commits", m.Digest.Hex()[:7], len(commits))
-	}
-	mc := commits[0]
-	parents, err := src.Parents(m.Digest.Hex())
-	if err != nil {
-		return git.Patch{}, false, err
-	}
-	entries, removals, err := src.MergeChangeset(m.Digest.Hex(), parents, dst.Prefix())
-	if err != nil {
-		return git.Patch{}, false, err
-	}
-	if len(entries) == 0 && len(removals) == 0 {
-		return git.Patch{}, true, nil
-	}
-	desired, err := dst.DesiredTree(entries, removals)
-	if err != nil {
-		return git.Patch{}, false, err
-	}
-	diffs, err := dst.TreeDiffs(desired)
-	if err != nil {
-		return git.Patch{}, false, err
-	}
-	if len(diffs) == 0 {
-		return git.Patch{}, true, nil
-	}
-	when, err := mc.AuthorTime()
-	if err != nil {
-		return git.Patch{}, false, err
-	}
-	subject := mc.Title()
-	patch := git.Patch{
-		ID:      m.Digest,
-		Author:  mc.AuthorIdent(),
-		Time:    when,
-		Subject: subject,
-		Body:    strings.TrimSpace(strings.TrimPrefix(mc.Body, subject)),
-		Diffs:   diffs,
-	}
-	return patch, false, nil
-}
-
-// applyPatch applies patch to the destination repository with loud
-// pausing on genuine conflicts, counts commits that actually moved the
-// destination HEAD into *ncommit, and copies any LFS objects the patch
-// touches from the source repository.
-func applyPatch(dst, src *git.Repo, patch git.Patch, c *git.Commit, ncommit *int) {
-	headBeforeApply, err := dst.Head()
-	if err != nil {
-		log.Fatal(err)
-	}
-	*ncommit++
-	log.Printf("applying %s", c)
-	if err := dst.Apply(patch); err != nil {
-		if inProgress, _ := dst.InProgressAM(); inProgress {
-			log.Printf("conflict: %s did not apply cleanly", patch)
-			log.Printf("the session is paused for manual resolution in %s", dst.RepoRoot())
-			log.Printf("  inspect:   git -C %s status", dst.RepoRoot())
-			log.Printf("             git -C %s am --show-current-patch=diff", dst.RepoRoot())
-			log.Printf("  resolve:   edit the conflicted files, then git -C %s add <files>", dst.RepoRoot())
-			log.Printf("             git -C %s am --continue   (or --abort to abandon the session)", dst.RepoRoot())
-			log.Printf("  then:      re-run this grit command to finish the remaining commits and push")
-		}
-		log.Fatalf("%s: apply %s: %s", dst, patch, err)
-	}
-	if headAfterApply, herr := dst.Head(); herr == nil && headAfterApply == headBeforeApply {
-		// Three-way application concluded that the destination already
-		// contained this change: nothing was committed.
-		*ncommit--
-		log.Printf("no changes for %s; treated as converged", c)
-	}
-	if !patch.MaybeContainsLFSPointer() {
-		log.Debug.Printf("%s: patch contains no LFS pointers", patch)
-		return
-	}
-	// Copy any LFS objects that were touched by this change.
-	// Doing it this way allows us to download only LFS objects
-	// that actually need to be transferred.
-	srcRelative := srcRelativeDiffPaths(patch.Diffs, dst.Prefix())
-	ptrs, err := dst.ListLFSPointers()
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, ptr := range ptrs {
-		if !srcRelative[ptr] {
-			continue
-		}
-		if err := dst.CopyLFSObject(src, ptr); err != nil {
-			log.Fatalf("copying LFS object %s: %v", ptr, err)
+	for _, c := range blob {
+		if c != '0' {
+			return false
 		}
 	}
-}
-
-// dropForeignMergedAncestry removes candidates merged in from a history
-// sharing no common ancestor with the source-side resume revision ("repo
-// absorption" merges): such patches are expressed against parent states the
-// destination never held, so replaying them corrupts drifted files, while
-// their net content arrives through the merges' own reconciliation. Internal
-// side branches, which do share history with the anchor, keep being copied
-// individually.
-//
-// Every parent of every merge is inspected: git assigns parent order from
-// the committer's checkout state at merge time, so an unrelated lineage can
-// be the FIRST parent (a foreign branch merged the mainline and was itself
-// fast-forwarded), and a foreign history can internally merge anchored side
-// branches whose shared ancestry must not mask the foreign first parent.
-// Merge reconciliation is parent-symmetric: it unions candidate paths over
-// all parents and pins the merge's own tree, so excluding any disjoint
-// parent loses no content. A related first parent costs one merge-base call
-// and nothing else.
-//
-// An empty anchor revision (initial synchronization) is passed through
-// unchanged: with no synchronized revision there is no reference to be
-// disjoint from (every root is equally unrelated), and refusing to
-// replay would mirror nothing for sources absorbed before their first sync.
-// Overlapping paths across disjoint roots pause loudly through the ordinary
-// conflict machinery; merged content still converges through reconciliation.
-//
-// An anchor sharing no history with the source branch itself (a rewritten
-// source history whose pre-rewrite digests still resolve, or similar legacy
-// state) also stands the filter down: classifying against such a reference
-// would discard legitimate mainline work. An anchor that is itself an
-// absorbed foreign commit left behind by older grit versions remains outside
-// automatic recovery and needs manual repair; grit no longer creates one,
-// because excluded commits are never applied or tagged.
-func dropForeignMergedAncestry(src *git.Repo, commits []*git.Commit, srcAnchor, srcTip string) []*git.Commit {
-	if srcAnchor == "" {
-		return commits
-	}
-	switch shared, err := src.HasCommonAncestor(srcAnchor, srcTip); {
-	case err != nil:
-		log.Fatalf("%s: merge-base between resume anchor %s and %s: %v", src, srcAnchor, srcTip, err)
-	case !shared:
-		log.Printf("resume anchor %s shares no history with source branch %s: "+
-			"skipping unrelated-history exclusion for this run", srcAnchor, srcTip)
-		return commits
-	}
-	var foreign map[string]bool
-	for _, c := range commits {
-		parents, err := src.Parents(c.Digest.Hex())
-		if err != nil {
-			log.Fatalf("%s: inspecting %s for merge parents: %v", src, c.Digest.Hex()[:7], err)
-		}
-		if len(parents) < 2 {
-			continue
-		}
-		for _, parent := range parents {
-			shared, err := src.HasCommonAncestor(srcAnchor, parent)
-			if err != nil {
-				log.Fatalf("%s: merge-base against merged-in parent %s: %v", src, parent[:7], err)
-			}
-			if shared {
-				continue
-			}
-			lineage, err := src.RevListExcluding(parent, srcAnchor)
-			if err != nil {
-				log.Fatalf("%s: rev-list %s: %v", src, parent[:7], err)
-			}
-			if foreign == nil {
-				foreign = make(map[string]bool, len(lineage))
-			}
-			for _, hex := range lineage {
-				foreign[hex] = true
-			}
-			log.Printf("merge %s brings unrelated history via parent %s: excluding %d commits from replay; their content arrives through the merge reconciliation", c, parent[:7], len(lineage))
-		}
-	}
-	if len(foreign) == 0 {
-		return commits
-	}
-	kept := make([]*git.Commit, 0, len(commits))
-	for _, c := range commits {
-		if !foreign[c.Digest.Hex()] {
-			kept = append(kept, c)
-		}
-	}
-	return kept
-}
-
-// processedSourceIDs returns the set of shipit source ids recorded in
-// the destination repository's history. Only ids of at least seven
-// characters are trusted, mirroring strip-commit's minimum: shorter ids
-// would exclude disproportionately large slices of the digest space.
-func processedSourceIDs(dst *git.Repo) (map[string]bool, error) {
-	// Tag state is message-level; a prefix pathspec would silently empty
-	// the set whenever the prefix subtree is absent from the worktree,
-	// defeating exactly-once exclusion and degrading to full replays.
-	commits, err := dst.LogIgnoringPrefix("--grep=shipit-source-id:")
-	if err != nil {
-		return nil, err
-	}
-	processed := make(map[string]bool)
-	for _, c := range commits {
-		for _, id := range c.OwnLineShipitIDs() {
-			if len(id) >= 7 {
-				processed[id] = true
-			}
-		}
-	}
-	return processed, nil
-}
-
-// srcRelativeDiffPaths maps destination-relative diff paths back to
-// source-relative ones: patch paths carry the destination prefix (the
-// source prefix was rewritten away), while git-lfs pointer listings are
-// prefix-stripped. Matching happens in source-relative space so that
-// prefixed destinations are not silently skipped.
-func srcRelativeDiffPaths(diffs []git.Diff, dstPrefix string) map[string]bool {
-	srcRelative := make(map[string]bool, len(diffs))
-	for _, diff := range diffs {
-		srcRelative[strings.TrimPrefix(diff.Path, dstPrefix)] = true
-	}
-	return srcRelative
-}
-
-// isProcessed reports whether the provided full source digest is
-// accounted for by a recorded shipit source id, either exactly or (for
-// legacy, abbreviated ids) by prefix. Residual ambiguity: a destination
-// message that quotes an id on its own line (including one whose
-// four-space indentation Log dedents away) is indistinguishable from a
-// real tag, the same exposure the anchor walk has always had.
-func isProcessed(hex string, processed map[string]bool) bool {
-	if processed[hex] {
-		return true
-	}
-	for id := range processed {
-		if len(id) < len(hex) && strings.HasPrefix(hex, id) {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
 // parseSpec splits a repository spec into its url, prefix, and branch
@@ -1020,144 +795,4 @@ func parseSpec(spec string) (url, prefix, branch string, err error) {
 	default:
 		return "", "", "", fmt.Errorf("invalid spec %s: too many comma-separated fields", spec)
 	}
-}
-
-type rewriteRule struct {
-	pathRe *regexp.Regexp // matched against the pathname
-	oldRe  *regexp.Regexp // matched against each line in the file
-	new    []byte         // replacement
-}
-
-// parseRewriteRule parses the parameter of a rewrite rule into its
-// path regexp, line regexp, and replacement.
-func parseRewriteRule(rule string) (r rewriteRule, err error) {
-	parts := strings.SplitN(rule, ":", 2)
-	if len(parts) != 2 {
-		return r, fmt.Errorf("invalid rewrite rule %s", rule)
-	}
-	if r.pathRe, err = regexp.Compile(parts[0]); err != nil {
-		return r, fmt.Errorf("rewrite: invalid path regexp %s: %s", parts[0], err)
-	}
-	if len(parts[1]) < 3 {
-		return r, fmt.Errorf("rewrite: rule '%s' must be of form rewrite:pathre:/from_re/to_re/", rule)
-	}
-	sep := parts[1][0:1]
-	parts = strings.Split(parts[1][1:], sep)
-	if len(parts) != 3 || parts[2] != "" {
-		return r, fmt.Errorf("rewrite: rule '%s' must be of form rewrite:pathre:/from_re/to_re/", rule)
-	}
-	if r.oldRe, err = regexp.Compile(parts[0]); err != nil {
-		return r, fmt.Errorf("rewrite: invalid 'from' regexp %s: %s", parts[0], err)
-	}
-	r.new = []byte(parts[1])
-	return r, nil
-}
-
-func (r *rewriteRule) rewrite(diff []byte) []byte {
-	result := bytes.Buffer{}
-	for _, line := range bytes.Split(diff, []byte("\n")) {
-		line = r.oldRe.ReplaceAll(line, r.new)
-		result.Write(line)
-		result.WriteByte('\n')
-	}
-	return result.Bytes()
-}
-
-type rules struct {
-	strip             []*regexp.Regexp
-	stripMessagePaths []*regexp.Regexp
-	// We store strip prefixes as strings since digesters refuse
-	// to parse odd-length hex strings and git typically gives out
-	// a prefix with 7 digits.
-	stripCommits []string
-	rewrite      []rewriteRule
-}
-
-// isStripped returns whether this commit matches the strip rules of
-// the rule set r.
-func (r rules) isStripped(c *git.Commit) bool {
-	for _, stripped := range r.stripCommits {
-		if strings.HasPrefix(c.Digest.Hex(), stripped) {
-			return true
-		}
-	}
-	return false
-}
-
-// mayRewrite reports whether any rewrite rule targets the provided
-// path.
-func (r rules) mayRewrite(path string) bool {
-	for _, rule := range r.rewrite {
-		if rule.pathRe.MatchString(path) {
-			return true
-		}
-	}
-	return false
-}
-
-// isPathStripped returns whether the provided path is stripped by the
-// ruleset's strip path rules.
-func (r rules) isPathStripped(path string) (bool, *regexp.Regexp) {
-	for _, re := range r.strip {
-		if re.MatchString(path) {
-			return true, re
-		}
-	}
-	return false, nil
-}
-
-// isMessagePathStripped returns whether the provided path is stripped
-// by the ruleset's message strip rules.
-func (r rules) isMessagePathStripped(path string) (bool, *regexp.Regexp) {
-	for _, re := range r.stripMessagePaths {
-		if re.MatchString(path) {
-			return true, re
-		}
-	}
-	return false, nil
-}
-
-var binaryPatchMarker = []byte("GIT binary patch")
-
-// rewriteDiff applies the ruleset's rewrite rules to the provided diff.
-// Diffs carrying git binary sections are never rewritten: git
-// serializes NUL-free binary files as ordinary textual diffs. Such
-// payloads are indistinguishable from text at this level; rewrite
-// rules must therefore be anchored narrowly enough not to match them.
-func (r rules) rewriteDiff(diff *git.Diff) {
-	// The parser places binary payloads (including their "GIT binary
-	// patch" marker) in Meta and leaves Body empty; textual diffs carry
-	// the payload in Body. Neither may be rewritten, and rewriting an
-	// empty body must not manufacture content.
-	if bytes.Contains(diff.Meta, binaryPatchMarker) || bytes.Contains(diff.Body, binaryPatchMarker) {
-		return
-	}
-	if len(diff.Body) == 0 {
-		return
-	}
-	for _, r := range r.rewrite {
-		if r.pathRe.MatchString(diff.Path) {
-			diff.Body = r.rewrite(diff.Body)
-		}
-	}
-}
-
-// isCommitApplicable returns whether the provided commit is non-empty
-// in the provided repository and prefix.
-func (r rules) isCommitApplicable(c *git.Commit, src *git.Repo) (bool, error) {
-	if r.isStripped(c) {
-		return false, nil
-	}
-	patch, err := src.Patch(c.Digest, "")
-	if err != nil {
-		return false, err
-	}
-	var ndiff int
-	for _, diff := range patch.Diffs {
-		if match, _ := r.isPathStripped(diff.Path); match {
-			continue
-		}
-		ndiff++
-	}
-	return ndiff > 0, nil
 }

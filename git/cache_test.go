@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -232,6 +233,9 @@ func TestSweepAgesLegacyDirsByDirMtime(t *testing.T) {
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Errorf("stale legacy directory survived the sweep: %v", err)
 	}
+	if _, err := os.Stat(legacy + ".lock"); !os.IsNotExist(err) {
+		t.Errorf("swept lockless entry left its guard lock behind: %v", err)
+	}
 	if _, err := os.Stat(recentLegacy); err != nil {
 		t.Errorf("recent legacy directory was swept: %v", err)
 	}
@@ -361,5 +365,379 @@ func TestAnnounceOncePerProcess(t *testing.T) {
 	resetAnnouncements()
 	if !announceLegacy(p) {
 		t.Fatal("announcement must re-arm after a reset")
+	}
+}
+
+// TestSweepPreservesAgedEntryWithUnpushedCommit pins the sweep's
+// preservation of a destination-shaped entry whose unpushed tail is
+// entirely grit-authored: a continued session's resolved work carries the
+// shipit tag, so it must survive the sweep regardless of age.
+func TestSweepPreservesAgedEntryWithUnpushedCommit(t *testing.T) {
+	root := setCacheRoot(t)
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git seed
+		cd seed
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+	`)
+	entry := filepath.Join(root, "unpushedentry")
+	if err := os.MkdirAll(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	shell(t, dir, `git clone -q origin.git unpushedentry`)
+	entryWork := filepath.Join(dir, "unpushedentry")
+	shell(t, entryWork, `
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo local > local.txt
+		git add .
+		git commit -qm "unpushed resolved work" -m "fbshipit-source-id: 0123456789abcdef0123456789abcdef01234567"
+	`)
+	if out, err := exec.Command("mv", entryWork, entry).CombinedOutput(); err != nil {
+		t.Fatalf("mv entry: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(entry, heartbeatName), []byte("t"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ageEntry(t, entry, 400*24*time.Hour)
+
+	SweepCache()
+
+	if _, err := os.Stat(entry); err != nil {
+		t.Fatalf("entry with unpushed grit-authored commits was swept: %v", err)
+	}
+}
+
+// TestSweepPreservesDivergedEntryWithUnpushedCommit pins the sweep's
+// preservation of a destination-shaped entry whose unpushed tail diverged
+// from the remote tip (a third-party push moved it) but is entirely
+// grit-authored: the resolved session's work must survive regardless of
+// age.
+func TestSweepPreservesDivergedEntryWithUnpushedCommit(t *testing.T) {
+	root := setCacheRoot(t)
+	if err := os.MkdirAll(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+		echo local > local.txt
+		git add .
+		git commit -qm "unpushed resolved work" -m "fbshipit-source-id: 0123456789abcdef0123456789abcdef01234567"
+		cd ..
+		git clone -q origin.git other
+		cd other
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo remote > remote.txt
+		git add .
+		git commit -qm "independent remote advance"
+		git push -q origin master
+		cd ../work
+		git fetch -q origin
+	`)
+	entry := filepath.Join(root, "divergedentry")
+	if out, err := exec.Command("mv", filepath.Join(dir, "work"), entry).CombinedOutput(); err != nil {
+		t.Fatalf("mv entry: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(entry, heartbeatName), []byte("t"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ageEntry(t, entry, 400*24*time.Hour)
+
+	SweepCache()
+
+	if _, err := os.Stat(entry); err != nil {
+		t.Fatalf("diverged entry with unpushed grit-authored commits was swept: %v", err)
+	}
+}
+
+func TestSweepRemovesBehindEntry(t *testing.T) {
+	root := setCacheRoot(t)
+	if err := os.MkdirAll(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+		cd ..
+		git clone -q origin.git other
+		cd other
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo remote > remote.txt
+		git add .
+		git commit -qm "independent remote advance"
+		git push -q origin master
+		cd ../work
+		git fetch -q origin
+	`)
+	entry := filepath.Join(root, "behindentry")
+	if out, err := exec.Command("mv", filepath.Join(dir, "work"), entry).CombinedOutput(); err != nil {
+		t.Fatalf("mv entry: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(entry, heartbeatName), []byte("t"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ageEntry(t, entry, 400*24*time.Hour)
+
+	SweepCache()
+
+	if _, err := os.Stat(entry); !os.IsNotExist(err) {
+		t.Fatalf("behind entry with nothing unpushed survived the sweep: %v", err)
+	}
+}
+
+// TestSweepRemovesLinearizedSourceEntry pins the -linearize sweep leak fix:
+// Linearize rewrites the source clone's history with filter-branch, so the
+// entry diverges from its remote tip permanently, and the rewritten commits
+// are the source's own, carrying no grit authorship markers. A preserve
+// predicate keyed on divergence alone would keep a linearized source clone
+// in the cache forever; the authorship gate must let it age out by TTL.
+func TestSweepRemovesLinearizedSourceEntry(t *testing.T) {
+	root := setCacheRoot(t)
+	if err := os.MkdirAll(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+		git checkout -qb side
+		echo side > side.txt
+		git add .
+		git commit -qm side
+		git checkout -q master
+		git merge -q --no-ff -m "merge side" side
+		git push -q origin master
+	`)
+	entry := filepath.Join(root, "linearizedentry")
+	if out, err := exec.Command("mv", filepath.Join(dir, "work"), entry).CombinedOutput(); err != nil {
+		t.Fatalf("mv entry: %v\n%s", err, out)
+	}
+	// The same filter grit's Linearize applies: rewriting the merge
+	// leaves the local history permanently diverged from the remote tip.
+	shell(t, entry, `git filter-branch -f --parent-filter 'cut -f 2,3 -d " "'`)
+	if out, err := exec.Command("git", "-C", entry, "merge-base", "--is-ancestor", "HEAD", "origin/master").CombinedOutput(); err == nil {
+		t.Fatalf("fixture must diverge from the remote tip after linearize, but HEAD is an ancestor: %s", out)
+	}
+	if err := os.WriteFile(filepath.Join(entry, heartbeatName), []byte("t"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ageEntry(t, entry, 400*24*time.Hour)
+
+	SweepCache()
+
+	if _, err := os.Stat(entry); !os.IsNotExist(err) {
+		t.Fatalf("linearized source entry survived the sweep: %v", err)
+	}
+}
+
+// TestSweepRemovesDivergedEntryWithPartiallyForeignTail pins the
+// every-commit authorship gate: a diverged tail mixing grit-authored
+// commits with foreign ones is not preservable (open discards such a
+// lineage via PreservedTailIsGritAuthored), so the sweep must not keep it
+// forever either.
+func TestSweepRemovesDivergedEntryWithPartiallyForeignTail(t *testing.T) {
+	root := setCacheRoot(t)
+	if err := os.MkdirAll(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+		echo resolved > resolved.txt
+		git add .
+		git commit -qm "resolved session work" -m "fbshipit-source-id: 0123456789abcdef0123456789abcdef01234567"
+		echo foreign > foreign.txt
+		git add .
+		git commit -qm "a foreign commit without grit markers"
+		cd ..
+		git clone -q origin.git other
+		cd other
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo remote > remote.txt
+		git add .
+		git commit -qm "independent remote advance"
+		git push -q origin master
+		cd ../work
+		git fetch -q origin
+	`)
+	entry := filepath.Join(root, "mixedtailentry")
+	if out, err := exec.Command("mv", filepath.Join(dir, "work"), entry).CombinedOutput(); err != nil {
+		t.Fatalf("mv entry: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(entry, heartbeatName), []byte("t"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ageEntry(t, entry, 400*24*time.Hour)
+
+	SweepCache()
+
+	if _, err := os.Stat(entry); !os.IsNotExist(err) {
+		t.Fatalf("diverged entry with a partially foreign tail survived the sweep: %v", err)
+	}
+}
+
+// TestSweepPreservesEntryWithNonCommitRemoteTip pins the tip-verification
+// arm of the authorship gate: a remote-tracking ref pointing at a
+// non-commit object (possible only through manual ref surgery) fails the
+// ancestor check, and git log would silently drop its exclusion —
+// overbroadening the tail to the entry's full history, whose unmarked
+// base commits would wrongly evict preservable work. The sweep must
+// treat the unpeelable tip as inconclusive and preserve.
+func TestSweepPreservesEntryWithNonCommitRemoteTip(t *testing.T) {
+	root := setCacheRoot(t)
+	if err := os.MkdirAll(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+		echo resolved > resolved.txt
+		git add .
+		git commit -qm "unpushed resolved work" -m "fbshipit-source-id: 0123456789abcdef0123456789abcdef01234567"
+		blob=$(git hash-object base.txt)
+		git update-ref refs/remotes/origin/master "$blob"
+	`)
+	entry := filepath.Join(root, "blobtipentry")
+	if out, err := exec.Command("mv", filepath.Join(dir, "work"), entry).CombinedOutput(); err != nil {
+		t.Fatalf("mv entry: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(entry, heartbeatName), []byte("t"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ageEntry(t, entry, 400*24*time.Hour)
+
+	SweepCache()
+
+	if _, err := os.Stat(entry); err != nil {
+		t.Fatalf("entry with a non-commit remote tip was swept: %v", err)
+	}
+}
+
+// TestSweepPreservesCheckoutWithoutRemoteRefs pins the preservation
+// bias: a checkout holding commits but zero remote-tracking refs is
+// inconclusive (its tips cannot be read), so it must survive the sweep
+// rather than fall through to eviction. Reproduces the pre-fix hole where
+// an empty for-each-ref listing skipped the loop and returned false.
+func TestSweepPreservesCheckoutWithoutRemoteRefs(t *testing.T) {
+	root := setCacheRoot(t)
+	if err := os.MkdirAll(root, 0777); err != nil {
+		t.Fatal(err)
+	}
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > base.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+		echo local > local.txt
+		git add .
+		git commit -qm "unpushed resolved work"
+		git remote remove origin
+	`)
+	entry := filepath.Join(root, "noremoterefs")
+	if out, err := exec.Command("mv", filepath.Join(dir, "work"), entry).CombinedOutput(); err != nil {
+		t.Fatalf("mv entry: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", entry, "for-each-ref", "--format=%(objectname)", "refs/remotes/").CombinedOutput(); err != nil || len(out) != 0 {
+		t.Fatalf("fixture must have zero remote-tracking refs, got %q, %v", out, err)
+	}
+	if err := os.WriteFile(filepath.Join(entry, heartbeatName), []byte("t"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ageEntry(t, entry, 400*24*time.Hour)
+
+	SweepCache()
+
+	if _, err := os.Stat(entry); err != nil {
+		t.Fatalf("checkout without remote refs was swept: %v", err)
 	}
 }

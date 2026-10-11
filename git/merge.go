@@ -49,6 +49,23 @@ func (r *Repo) InPrefix(p string) bool {
 	return pathInPrefix(p, r.prefix)
 }
 
+// joinDst relocates a prefix-stripped path under a destination prefix,
+// whatever spelling the prefix uses: an empty prefix leaves the path alone,
+// a slash-terminated prefix concatenates, and any other non-empty prefix
+// gains the separator it lacks.
+func joinDst(prefix, rel string) string {
+	if prefix == "" {
+		return rel
+	}
+	if strings.HasSuffix(prefix, "/") {
+		return prefix + rel
+	}
+	if rel == "" {
+		return prefix
+	}
+	return prefix + "/" + rel
+}
+
 // scopedPath pairs a candidate path's repository-full form with its
 // prefix-stripped form: the full path addresses git exactly as the tree
 // stores it, the stripped form relocates the path under the destination
@@ -106,28 +123,38 @@ func (r *Repo) MergeChangeset(commit string, parents []string, dstPrefix string)
 		return nil, nil, nil
 	}
 
-	specs := make([]string, len(inScope))
-	for i, s := range inScope {
-		specs[i] = ":(literal)" + s.full
-	}
-	out, err := r.git(nil, append([]string{"ls-tree", "-r", "-z", commit, "--"}, specs...)...)
-	if err != nil {
-		return nil, nil, err
-	}
+	// Specs are resolved in bounded batches: a merge touching thousands
+	// of files would otherwise exceed the OS argv limit (notably small on
+	// macOS) when every path rides along as a command-line argument.
+	const lsTreeBatch = 500
 	state := map[string]TreeEntry{}
-	for _, line := range strings.Split(string(out), "\x00") {
-		if line == "" {
-			continue
+	for start := 0; start < len(inScope); start += lsTreeBatch {
+		end := start + lsTreeBatch
+		if end > len(inScope) {
+			end = len(inScope)
 		}
-		meta, p, ok := strings.Cut(line, "\t")
-		if !ok {
-			return nil, nil, fmt.Errorf("malformed ls-tree output %q", line)
+		specs := make([]string, 0, end-start)
+		for _, s := range inScope[start:end] {
+			specs = append(specs, ":(literal)"+s.full)
 		}
-		fields := strings.Fields(meta)
-		if len(fields) != 3 {
-			return nil, nil, fmt.Errorf("malformed ls-tree entry %q", line)
+		out, err := r.git(nil, append([]string{"-c", "core.quotePath=false", "ls-tree", "-r", "-z", commit, "--"}, specs...)...)
+		if err != nil {
+			return nil, nil, err
 		}
-		state[p] = TreeEntry{Path: p, Mode: fields[0], Blob: fields[2]}
+		for _, line := range strings.Split(string(out), "\x00") {
+			if line == "" {
+				continue
+			}
+			meta, p, ok := strings.Cut(line, "\t")
+			if !ok {
+				return nil, nil, fmt.Errorf("malformed ls-tree output %q", line)
+			}
+			fields := strings.Fields(meta)
+			if len(fields) != 3 {
+				return nil, nil, fmt.Errorf("malformed ls-tree entry %q", line)
+			}
+			state[p] = TreeEntry{Path: p, Mode: fields[0], Blob: fields[2]}
+		}
 	}
 	var (
 		entries  []TreeEntry
@@ -135,10 +162,10 @@ func (r *Repo) MergeChangeset(commit string, parents []string, dstPrefix string)
 	)
 	for _, s := range inScope {
 		if e, ok := state[s.full]; ok {
-			e.Path = dstPrefix + s.rel
+			e.Path = joinDst(dstPrefix, s.rel)
 			entries = append(entries, e)
 		} else {
-			removals = append(removals, dstPrefix+s.rel)
+			removals = append(removals, joinDst(dstPrefix, s.rel))
 		}
 	}
 	return entries, removals, nil
@@ -165,15 +192,19 @@ func (r *Repo) DesiredTree(entries []TreeEntry, removals []string) (string, erro
 	if _, err := r.gitEnv(env, nil, "read-tree", "HEAD"); err != nil {
 		return "", fmt.Errorf("read-tree HEAD: %v", err)
 	}
+	// Removals precede additions: a merge converting a file to a
+	// directory (or the reverse) would otherwise attempt to add an entry
+	// while the conflicting path is still in the temporary index, which
+	// git rejects as a file/directory conflict.
+	for _, p := range removals {
+		if _, err := r.gitEnv(env, nil, "update-index", "--force-remove", "--", p); err != nil {
+			return "", fmt.Errorf("update-index --force-remove %s: %v", p, err)
+		}
+	}
 	for _, e := range entries {
 		cacheinfo := fmt.Sprintf("%s,%s,%s", e.Mode, e.Blob, e.Path)
 		if _, err := r.gitEnv(env, nil, "update-index", "--add", "--cacheinfo", cacheinfo); err != nil {
 			return "", fmt.Errorf("update-index --cacheinfo %s: %v", cacheinfo, err)
-		}
-	}
-	for _, p := range removals {
-		if _, err := r.gitEnv(env, nil, "update-index", "--force-remove", p); err != nil {
-			return "", fmt.Errorf("update-index --force-remove %s: %v", p, err)
 		}
 	}
 	out, err := r.gitEnv(env, nil, "write-tree")
@@ -202,7 +233,12 @@ func (r *Repo) TreeDiffs(tree string) ([]Diff, error) {
 		return nil, err
 	}
 	var diffs []Diff
-	err = foreach(out, "diff", func(section []byte) error {
+	// Split on the full header: bare base85 binary-payload lines can start
+	// with "diff" (no space in the payload alphabet), so the short prefix
+	// would false-split inside binary sections and fail loudly downstream.
+	// The trailing space is critical: base85 cannot encode a space, so
+	// "diff --git " cannot appear mid-payload.
+	err = foreach(out, "diff --git ", func(section []byte) error {
 		header := scanLine(&section)
 		path := parseDiffHeader(header)
 		if path == nil {

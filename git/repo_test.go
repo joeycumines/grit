@@ -407,7 +407,14 @@ func TestLFS(t *testing.T) {
 	}
 }
 
-func TestResetToRemoteUsesOriginHead(t *testing.T) {
+// TestOriginHeadSurvivesFetchHeadClobbering pins the snapshot invariant
+// the push-time preservation gate depends on: open captures the
+// destination tip from FETCH_HEAD before any object seeding, and
+// FetchObjects later clobbers FETCH_HEAD with the source tip (grit stays
+// compatible with git versions lacking --no-write-fetch-head), so
+// OriginHead must keep serving the captured destination tip — never the
+// clobbered value — when main re-checks authorship before publishing.
+func TestOriginHeadSurvivesFetchHeadClobbering(t *testing.T) {
 	dir, cleanup := testutil.TempDir(t, "", "")
 	if *nocleanup {
 		log.Println("directory", dir)
@@ -444,21 +451,14 @@ func TestResetToRemoteUsesOriginHead(t *testing.T) {
 	if originHead == "" {
 		t.Fatalf("originHead empty")
 	}
-	shell(t, dir, `
-		git -C `+dstRepo.RepoRoot()+` config user.email you@example.com
-		git -C `+dstRepo.RepoRoot()+` config user.name "your name"
-		echo local > `+dstRepo.RepoRoot()+`/local.txt
-		git -C `+dstRepo.RepoRoot()+` add local.txt
-		git -C `+dstRepo.RepoRoot()+` commit -m'local dst commit'
-	`)
 	if err := dstRepo.FetchObjects(filepath.Join(dir, "src.git"), "master"); err != nil {
 		t.Fatalf("FetchObjects: %v", err)
 	}
 	// FetchObjects deliberately clobbers FETCH_HEAD with the source tip
 	// (no --no-write-fetch-head: that flag needs git >= 2.29 and nothing
 	// reads FETCH_HEAD after open captures the snapshot). The invariant
-	// under test is that ResetToRemote ignores the clobbered file and
-	// restores the captured destination tip.
+	// under test is that OriginHead ignores the clobbered file and keeps
+	// serving the captured destination tip.
 	fetchHead, err := dstRepo.RevParse("FETCH_HEAD")
 	if err != nil {
 		t.Fatalf("FETCH_HEAD: %v", err)
@@ -470,21 +470,18 @@ func TestResetToRemoteUsesOriginHead(t *testing.T) {
 	if fetchHead != srcHead {
 		t.Fatalf("test setup drifted: FETCH_HEAD %s != seeded source tip %s", fetchHead, srcHead)
 	}
-	if err := dstRepo.ResetToRemote(); err != nil {
-		t.Fatalf("ResetToRemote: %v", err)
+	if got := dstRepo.OriginHead(); got != originHead {
+		t.Fatalf("OriginHead() = %s after FetchObjects, want the captured snapshot %s", got, originHead)
 	}
-	head, err := dstRepo.Head()
+	if originHead == fetchHead {
+		t.Fatalf("OriginHead() followed the clobbered FETCH_HEAD (source tip %s), want destination tip %s", fetchHead, originHead)
+	}
+	dstTip, err := dstRepo.RevParse("refs/remotes/origin/master")
 	if err != nil {
-		t.Fatalf("Head: %v", err)
+		t.Fatalf("refs/remotes/origin/master: %v", err)
 	}
-	if head != originHead {
-		t.Fatalf("ResetToRemote reset to %s (FETCH_HEAD holds source tip %s), want originHead %s", head, fetchHead, originHead)
-	}
-	if head == srcHead {
-		t.Fatalf("ResetToRemote incorrectly reset to source tip %s", srcHead)
-	}
-	if _, err := os.Stat(filepath.Join(dstRepo.RepoRoot(), "local.txt")); !os.IsNotExist(err) {
-		t.Fatalf("local.txt still exists after reset, should have been discarded")
+	if originHead != dstTip {
+		t.Fatalf("captured originHead %s != destination remote tip %s", originHead, dstTip)
 	}
 }
 
@@ -909,6 +906,52 @@ func shell(t *testing.T, dir, script string) {
 	t.Log(stderr.String())
 }
 
+func TestLogResistsHostileConfig(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git master
+		cd master
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo base > f.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+	`)
+	r := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "master"),
+		prefix: "", branch: "master"}
+	// Hostile config that breaks default log parsing.
+	r.Configure("format.pretty", "oneline")
+	r.Configure("log.decorate", "short")
+
+	commits, err := r.Log()
+	if err != nil {
+		t.Fatalf("Log under hostile config: %v", err)
+	}
+	if len(commits) != 1 {
+		t.Fatalf("expected 1 commit, got %d", len(commits))
+	}
+	if commits[0].Title() != "base" {
+		t.Fatalf("title = %q, want %q", commits[0].Title(), "base")
+	}
+
+	// LogIgnoringPrefix shares the same parser; it must resist the same
+	// hostile config (anchor walks and authorship gates depend on it).
+	ignCommits, err := r.LogIgnoringPrefix()
+	if err != nil {
+		t.Fatalf("LogIgnoringPrefix under hostile config: %v", err)
+	}
+	if len(ignCommits) != 1 || ignCommits[0].Title() != "base" {
+		t.Fatalf("LogIgnoringPrefix parsed %d commits, want 1 titled base", len(ignCommits))
+	}
+}
+
 func TestHasCommonAncestorAndRevListExcluding(t *testing.T) {
 	dir, cleanup := testutil.TempDir(t, "", "")
 	if *nocleanup {
@@ -985,5 +1028,124 @@ func TestHasCommonAncestorAndRevListExcluding(t *testing.T) {
 	}
 	if len(mixed) != 3 {
 		t.Fatalf("RevListExcluding(master, base) returned %d commits; want 3: %v", len(mixed), mixed)
+	}
+}
+
+func TestLogScopesRevisionNamedPrefix(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git -c init.defaultBranch=master init --bare -b master repo
+		git clone -c init.defaultBranch=master repo checkout
+		cd checkout
+		git config user.email you@example.com
+		git config user.name "your name"
+		mkdir -p main
+		echo scoped > main/file1
+		echo other > top.txt
+		git add .
+		git commit -m'first commit'
+		git tag main
+		echo more > top.txt
+		git commit -am'second commit'
+		git push -q origin master --tags
+	`)
+	repo, err := Open(filepath.Join(dir, "repo"), "main", "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commits, err := repo.Log()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(commits), 1; got != want {
+		t.Fatalf("Log with revision-named prefix returned %d commits, want %d", got, want)
+	}
+	if got, want := commits[0].Title(), "first commit"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestIsAncestorErrorsOnBadRevision(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo x > x.txt
+		git add .
+		git commit -qm one
+		git push -q origin master
+	`)
+	r := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "work"),
+		prefix: "", branch: "master"}
+	head, err := r.RevParse("master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.IsAncestor("deadbeef", head); err == nil {
+		t.Fatal("IsAncestor(deadbeef) returned no error; transient git failures must surface, not map to false")
+	}
+	if authored, err := r.PreservedTailIsGritAuthored("deadbeef"); err != nil || authored {
+		t.Fatalf("PreservedTailIsGritAuthored(deadbeef) = %v, %v; unknown tips are disjoint, not errors", authored, err)
+	}
+}
+
+func TestHeadEntryNewlineAndAmbiguity(t *testing.T) {
+	dir, cleanup := testutil.TempDir(t, "", "")
+	t.Cleanup(func() {
+		if !*nocleanup {
+			cleanup()
+		}
+	})
+	shell(t, dir, `
+		git init -q --bare origin.git
+		git clone -q origin.git work
+		cd work
+		git config user.email you@example.com
+		git config user.name "your name"
+		echo plain > plain.txt
+		git add .
+		git commit -qm base
+		git push -q origin master
+	`)
+	r := &Repo{url: filepath.Join(dir, "origin.git"), root: filepath.Join(dir, "work"),
+		prefix: "", branch: "master"}
+	blob, mode, err := r.HeadEntry("plain.txt")
+	if err != nil {
+		t.Fatalf("HeadEntry(plain.txt): %v", err)
+	}
+	if mode != "100644" || blob == zeroBlob || len(blob) != 40 {
+		t.Fatalf("HeadEntry(plain.txt) = %q %q, want 40-hex blob + 100644", blob, mode)
+	}
+	if blob, mode, err := r.HeadEntry("missing.txt"); err != nil || mode != "" || blob != zeroBlob {
+		t.Fatalf("HeadEntry(missing.txt) = %q %q %v, want zero blob", blob, mode, err)
+	}
+	// A newline in the name must resolve to exactly one record: the -z
+	// form keeps the method from splitting the name into two lines.
+	shell(t, dir, `
+		cd work
+		printf 'x' > 'li
+ne.txt'
+		git add -A
+		git commit -qm 'newline path'
+	`)
+	blob, mode, err = r.HeadEntry("li\nne.txt")
+	if err != nil {
+		t.Fatalf("HeadEntry(newline path): %v", err)
+	}
+	if mode != "100644" || blob == zeroBlob {
+		t.Fatalf("HeadEntry(newline path) = %q %q, want real blob", blob, mode)
 	}
 }

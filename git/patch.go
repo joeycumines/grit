@@ -147,9 +147,15 @@ func (p Patch) Write(w io.Writer) error {
 	body := strings.Replace(p.Body, "\ndiff", "\n"+zeroWidthSpace+"diff", -1)
 	body = strings.Replace(body, "\n---", "\n"+zeroWidthSpace+"---", -1)
 	body = strings.Replace(body, "\n+++", "\n"+zeroWidthSpace+"+++", -1)
+	for _, tok := range []string{"diff", "---", "+++"} {
+		if strings.HasPrefix(body, tok) {
+			body = zeroWidthSpace + body
+			break
+		}
+	}
 	fmt.Fprintf(ew, "\n%s\n---\n\n\n", body)
 	for _, diff := range p.Diffs {
-		if strings.ContainsAny(diff.Path, "\"\t\n\r") || hasControlChars(diff.Path) {
+		if strings.ContainsAny(diff.Path, "\"\\\t\n\r") || hasControlChars(diff.Path) {
 			fmt.Fprintf(ew, "diff --git %s %s\n", quotePath("a/"+diff.Path), quotePath("b/"+diff.Path))
 		} else {
 			fmt.Fprintf(ew, "diff --git a/%s b/%s\n", diff.Path, diff.Path)
@@ -331,7 +337,7 @@ func foreach(b []byte, prefix string, do func(section []byte) error) error {
 	}
 }
 
-var quotedDiffHeaderRe = regexp.MustCompile(`^diff --git ("a/.*") ("b/.*")$`)
+var quotedDiffHeaderRe = regexp.MustCompile(`^diff --git ("a/(?:[^"\\]|\\.)*") ("b/(?:[^"\\]|\\.)*")$`)
 
 // parseDiffHeader extracts the repository-relative path from a
 // "diff --git" header line. Git emits two forms: symmetric unquoted

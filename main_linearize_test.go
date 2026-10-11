@@ -117,6 +117,68 @@ func TestGritLinearizeSyncsTangledHistoryOnce(t *testing.T) {
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)
 }
 
+// TestLinearizeKeepsFirstParentOnly pins the parent-filter contract:
+// after filter-branch with grit's parent filter, every rewritten commit
+// has exactly one parent. The filter keeps fields 2-3 ("-p <first-sha>")
+// of the filter-branch parent string, which arrives with a leading space
+// (verified live on git 2.56.0). The pre-existing end-to-end linearize
+// test covers grit.Linearize itself; this pins the shell contract it
+// depends on.
+func TestLinearizeKeepsFirstParentOnly(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "master")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-qm", "base")
+	run("checkout", "-qb", "side")
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-qm", "side")
+	run("checkout", "-q", "master")
+	run("merge", "-q", "--no-ff", "-m", "merge side", "side")
+	merges := func() string {
+		t.Helper()
+		out, err := exec.Command("git", "-C", dir, "rev-list", "--merges", "--count", "master").CombinedOutput()
+		if err != nil {
+			t.Fatalf("rev-list merges: %v\n%s", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if merges() == "0" {
+		t.Fatal("fixture has no merges to linearize")
+	}
+	// Same filter grit's Linearize applies.
+	if out, err := exec.Command("git", "-C", dir, "filter-branch", "-f", "--parent-filter", `cut -f 2,3 -d " "`, "master").CombinedOutput(); err != nil {
+		t.Fatalf("filter-branch: %v\n%s", err, out)
+	}
+	if got := merges(); got != "0" {
+		t.Fatalf("linearized history still has %s merges", got)
+	}
+	out, err := exec.Command("git", "-C", dir, "rev-list", "--parents", "master").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-list parents: %v\n%s", err, out)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if fields := strings.Fields(line); len(fields) > 2 {
+			t.Fatalf("commit %s has %d parents after Linearize, want at most one", fields[0][:7], len(fields)-1)
+		}
+	}
+}
+
 // TestGritLinearizeFailureAbortsLoudly proves a failing filter-branch
 // aborts the whole run before any destination work happens.
 func TestGritLinearizeFailureAbortsLoudly(t *testing.T) {

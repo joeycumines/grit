@@ -349,23 +349,73 @@ func TestIsCommitApplicable(t *testing.T) {
 	src, commits := fixtureRepo(t)
 
 	applicable := rules{}
-	ok, err := applicable.isCommitApplicable(commits["inPrefix"], src)
+	ok, err := applicable.isCommitApplicable(commits["inPrefix"], src, "")
 	if err != nil || !ok {
 		t.Fatalf("in-prefix change: ok=%v err=%v, want applicable", ok, err)
 	}
 
-	ok, err = applicable.isCommitApplicable(commits["outside"], src)
+	ok, err = applicable.isCommitApplicable(commits["outside"], src, "")
 	if err != nil || ok {
 		t.Fatalf("out-of-prefix-only change: ok=%v err=%v, want empty in prefix", ok, err)
 	}
 
 	stripping := rules{strip: []*regexp.Regexp{regexp.MustCompile(`^BUILD$`)}}
-	ok, err = stripping.isCommitApplicable(commits["stripped"], src)
+	ok, err = stripping.isCommitApplicable(commits["stripped"], src, "")
 	if err != nil || ok {
 		t.Fatalf("all-paths-stripped change: ok=%v err=%v, want not applicable", ok, err)
 	}
-	ok, err = stripping.isCommitApplicable(commits["inPrefix"], src)
+	ok, err = stripping.isCommitApplicable(commits["inPrefix"], src, "")
 	if err != nil || !ok {
 		t.Fatalf("strip rule leaked into unrelated commit: ok=%v err=%v", ok, err)
+	}
+
+	// Destination-prefix parity: with dstPrefix "out/", the same commits
+	// relocate exactly as the application loop relocates them, so rules
+	// anchored to destination paths agree in both places.
+	relocated := rules{strip: []*regexp.Regexp{regexp.MustCompile(`^out/BUILD$`)}}
+	ok, err = relocated.isCommitApplicable(commits["stripped"], src, "out/")
+	if err != nil || ok {
+		t.Fatalf("dst-prefixed strip missed relocated path: ok=%v err=%v", ok, err)
+	}
+	ok, err = relocated.isCommitApplicable(commits["inPrefix"], src, "out/")
+	if err != nil || !ok {
+		t.Fatalf("dst-prefixed rule leaked into unrelated commit: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSrcRelativeDiffPathsSlashlessPrefix(t *testing.T) {
+	diffs := []git.Diff{
+		{Path: "dst/f.txt"},
+		{Path: "dst/dir/g.txt"},
+		{Path: "dst"},
+		{Path: "dstf.txt"},
+	}
+	got := srcRelativeDiffPaths(diffs, "dst")
+	for _, want := range []string{"f.txt", "dir/g.txt", ""} {
+		if !got[want] {
+			t.Fatalf("missing %q in %v", want, got)
+		}
+	}
+	// A sibling merely sharing the prefix's leading bytes is not under
+	// the prefix and must pass through untouched.
+	if !got["dstf.txt"] {
+		t.Fatalf("phantom sibling stripped: %v", got)
+	}
+}
+
+func TestIsZeroBlob(t *testing.T) {
+	for _, tc := range []struct {
+		blob string
+		want bool
+	}{
+		{"", false},
+		{strings.Repeat("0", 40), true},
+		{strings.Repeat("0", 64), true},
+		{"ce013625030ba8dba906f756967f9e9ca394464a", false},
+		{strings.Repeat("0", 39) + "1", false},
+	} {
+		if got := isZeroBlob(tc.blob); got != tc.want {
+			t.Errorf("isZeroBlob(%q) = %v, want %v", tc.blob, got, tc.want)
+		}
 	}
 }
