@@ -374,15 +374,38 @@ func main() {
 			anchorIDs = last[0].ShipitID()
 		}
 		resolvable := false
+		disjoint := false
 		for _, id := range anchorIDs {
 			if _, rerr := src.RevParse(id + "^{commit}"); rerr == nil {
-				resolvable = true
-				break
+				// An id that resolves but is not an ancestor of the
+				// configured source branch cannot bound a meaningful
+				// resume range: id..srcBranch would enumerate commits
+				// unrelated to the branch being mirrored, and replaying
+				// them as patches would conflict with states the
+				// destination never held. This arises when the cache
+				// holds objects from reverse-direction syncs
+				// (refs/grit/src), absorbed foreign histories, or
+				// rewritten lineages whose pre-rewrite digests still
+				// resolve. Treat such anchors the same as unresolvable
+				// ones and walk past them.
+				isAnc, aerr := src.IsAncestor(id, srcBranch)
+				if aerr != nil {
+					log.Fatalf("%s: check ancestor of source branch %s for %s: %v", src, srcBranch, id, aerr)
+				}
+				if isAnc {
+					resolvable = true
+					break
+				}
+				disjoint = true
 			}
 		}
 		if len(anchorIDs) > 0 && !resolvable {
 			log.Printf("commit %s is not applicable to %s: skipping", last[0], dst)
-			log.Printf("anchor records unresolvable source id(s) %v; ignoring for resume", anchorIDs)
+			if disjoint {
+				log.Printf("anchor records source id(s) %v not ancestral to source branch %s; ignoring for resume", anchorIDs, srcBranch)
+			} else {
+				log.Printf("anchor records unresolvable source id(s) %v; ignoring for resume", anchorIDs)
+			}
 			head = last[0].Digest.Hex() + "^"
 			if _, err := dst.RevParse(head); err != nil {
 				log.Printf("anchor walk reached tagged root commit %s with no parent; falling through to initial synchronization", last[0])

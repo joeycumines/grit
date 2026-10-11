@@ -562,8 +562,10 @@ func TestGritInitialSyncConvergesAbsorbedHistory(t *testing.T) {
 // TestGritDisjointResumeAnchorSkipsExclusionFilter pins the guard for
 // resume anchors sharing no history with the current source branch (a
 // rewritten source history whose pre-rewrite digests still resolve in the
-// cached clone): classifying merges against such a reference would discard
-// legitimate side branches, so the filter stands down loudly instead.
+// cached clone): the anchor walk now detects the disjoint id and walks
+// past it, falling through to initial synchronization where tag-set
+// exclusion drops already-mirrored commits and convergence absorbs
+// equivalent content.
 func TestGritDisjointResumeAnchorSkipsExclusionFilter(t *testing.T) {
 	src, dst := setupGritRepos(t)
 
@@ -595,8 +597,8 @@ func TestGritDisjointResumeAnchorSkipsExclusionFilter(t *testing.T) {
 	src.git("push", "--force", "origin", "rewritten:"+testBranch)
 
 	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
-	if !strings.Contains(out, "shares no history") {
-		t.Fatalf("disjoint resume anchor did not stand down the exclusion filter:\n%s", out)
+	if !strings.Contains(out, "not ancestral to source branch") {
+		t.Fatalf("disjoint resume anchor was not detected and skipped:\n%s", out)
 	}
 	dst.pull()
 	compareDirs(t, filepath.Join(src.dir, "proj"), dst.dir)

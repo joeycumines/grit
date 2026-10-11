@@ -38,11 +38,13 @@ import (
 //
 // An anchor sharing no history with the source branch itself (a rewritten
 // source history whose pre-rewrite digests still resolve, or similar legacy
-// state) also stands the filter down: classifying against such a reference
-// would discard legitimate mainline work. An anchor that is itself an
-// absorbed foreign commit left behind by older grit versions remains outside
-// automatic recovery and needs manual repair; grit no longer creates one,
-// because excluded commits are never applied or tagged.
+// state) is now caught earlier in the anchor walk: such ids are treated as
+// unresolvable and walked past, so this function's disjoint-anchor branch
+// is unreachable from the main flow. It is retained as a defensive guard.
+// An anchor that is itself an absorbed foreign commit left behind by older
+// grit versions remains outside automatic recovery and needs manual repair;
+// grit no longer creates one, because excluded commits are never applied or
+// tagged.
 func dropForeignMergedAncestry(src *git.Repo, commits []*git.Commit, srcAnchor, srcTip string) []*git.Commit {
 	if srcAnchor == "" {
 		return commits

@@ -378,15 +378,20 @@ func (r *Repo) InProgressAM() (bool, error) {
 // revision, transient error) is returned, so callers cannot mistake a
 // broken read for a clean negative and discard state on its strength.
 func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {
-	out, err := r.git(nil, "merge-base", ancestor, descendant)
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return false, nil
-		}
-		return false, err
+	// Use --is-ancestor rather than parsing merge-base output: the
+	// command's exit code is the authoritative signal (0 = ancestor, 1 =
+	// not, other = error), and it works correctly for both full digests
+	// and legacy abbreviated ids, which the output-string comparison
+	// this function previously performed would always reject.
+	_, err := r.git(nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
 	}
-	return strings.TrimSpace(string(out)) == ancestor, nil
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 // HasCommonAncestor reports whether the two revisions share any common
