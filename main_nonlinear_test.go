@@ -616,6 +616,136 @@ func TestGritDisjointResumeAnchorSkipsExclusionFilter(t *testing.T) {
 	}
 }
 
+// TestGritTrailingDisjointAnchorIdResumesFromAncestral pins the walk's
+// choice of resume revision for hand-tagged multi-id anchors: grit emits
+// exactly one id per commit, but a hand-amended anchor can end with an
+// extra id that resolves in the cached source clone while sitting outside
+// the source branch's ancestry. Resuming from the trailing id (as the
+// pre-fix code did unconditionally) bounds the range with unrelated
+// history and disables the unrelated-history exclusion; the resume must
+// instead use the last id the walk verified as ancestral.
+func TestGritTrailingDisjointAnchorIdResumesFromAncestral(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	// Round 1 seeds the source cache with the original history so its
+	// digests still resolve after the rewrite below.
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+	disjointID := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+
+	// Rewrite the source branch from an orphan root containing only new
+	// content: every diff must escape convergence pruning so the rebuilt
+	// root mirrors as a real commit carrying its own shipit tag (a
+	// partially converged commit lands untagged with a convergence
+	// marker instead, which would leave the amended anchor below with
+	// no ancestral id at all).
+	src.git("checkout", "--orphan", "rewritten")
+	src.git("rm", "-rf", ".")
+	src.write("proj/fresh.txt", "f1")
+	src.write("proj/root.txt", "r1")
+	src.commit("rebuilt root")
+	src.git("push", "--force", "origin", "rewritten:"+testBranch)
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Hand-amend the newest destination anchor to record the round-1
+	// digest as a trailing id: resolvable in the cached source clone,
+	// disjoint from the rebuilt branch. The anchor stays valid through
+	// its ancestral first id.
+	msg := dst.gitOut("log", "-1", "--format=%B") + "shipit-source-id: " + disjointID + "\n"
+	dst.git("commit", "--amend", "-m", msg)
+	dst.git("push", "--force", "origin", "HEAD")
+
+	// New work on the rebuilt branch: only this commit may be replayed.
+	src.write("proj/late.txt", "l1")
+	src.commit("late work")
+	src.git("push", "origin", "rewritten:"+testBranch)
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "instead of trailing id") {
+		t.Fatalf("resume did not prefer the ancestral id over the trailing disjoint id:\n%s", out)
+	}
+	if strings.Contains(out, "shares no history with source branch") {
+		t.Fatalf("resume revision was disjoint from the source branch despite the walk's verification:\n%s", out)
+	}
+	dst.pull()
+	// The destination legitimately retains round-1's base.txt: the
+	// rebuilt branch never deletes it, so whole-tree comparison with
+	// the source prefix is not expected to hold. The mirrored content
+	// itself must all land.
+	for name, want := range map[string]string{"fresh.txt": "f1", "root.txt": "r1", "late.txt": "l1"} {
+		if got := dstRead(t, dst.dir, name); got != want {
+			t.Fatalf("%s did not land in the destination: %q", name, got)
+		}
+	}
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("history did not reach a fixed point:\n%s", out)
+	}
+}
+
+// TestGritMixedAnchorLogsEachIDCategory pins the walk's diagnostics for
+// anchors mixing ids that do not resolve at all with ids that resolve
+// but are not ancestral to the source branch: each skip message must
+// name exactly the ids it describes, so an operator can tell a rewritten
+// history (disjoint ids) apart from a recreated one (unresolvable ids).
+// The pre-fix code logged the disjoint variant with every id listed.
+func TestGritMixedAnchorLogsEachIDCategory(t *testing.T) {
+	src, dst := setupGritRepos(t)
+
+	srcSpec := src.bare + ",proj/," + testBranch
+	dstSpec := dst.bare + ",," + testBranch
+
+	// Round 1 seeds the source cache with the original history so its
+	// digests still resolve after the rewrite below.
+	src.write("proj/base.txt", "v1")
+	src.commit("first commit")
+	src.push()
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+	disjointID := strings.TrimSpace(src.gitOut("rev-parse", "HEAD"))
+
+	// Rewrite the source branch from an orphan root and sync, producing
+	// a fresh anchor recording the rebuilt root.
+	src.git("checkout", "--orphan", "rewritten")
+	src.git("rm", "-rf", ".")
+	src.write("proj/fresh.txt", "f1")
+	src.commit("rebuilt root")
+	src.git("push", "--force", "origin", "rewritten:"+testBranch)
+	src.gritSync(dst, "-push", srcSpec, dstSpec)
+	dst.pull()
+
+	// Hand-amend the newest anchor, replacing its recorded id with one
+	// unresolvable id and one resolvable-but-disjoint id.
+	garbageID := strings.Repeat("deadbeef", 5)
+	msg := "rebuilt root\n\nshipit-source-id: " + garbageID + "\nshipit-source-id: " + disjointID + "\n"
+	dst.git("commit", "--amend", "-m", msg)
+	dst.git("push", "--force", "origin", "HEAD")
+
+	out := gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "unresolvable source id(s) ["+garbageID+"]") {
+		t.Fatalf("mixed anchor did not log the unresolvable id in its own message:\n%s", out)
+	}
+	if !strings.Contains(out, "source id(s) ["+disjointID+"] not ancestral") {
+		t.Fatalf("mixed anchor did not log the disjoint id in its own message:\n%s", out)
+	}
+	if got := dstRead(t, dst.dir, "fresh.txt"); got != "f1" {
+		t.Fatalf("already-mirrored content was disturbed by the mixed anchor: %q", got)
+	}
+
+	out = gritOutput(t, src.gritBin, srcSpec, dstSpec)
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("history did not reach a fixed point:\n%s", out)
+	}
+}
+
 // TestGritBinaryFiles verifies that binary file changes within an
 // incremental sync range are serialized as applicable binary patches and
 // converge byte-for-byte. Without --binary, format-patch emits a

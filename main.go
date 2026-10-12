@@ -347,6 +347,12 @@ func main() {
 	// files and go.{mod,sum} files that may be modified independently
 	// in the source and destination repositories.
 	var lastCommit *git.Commit
+	// Source-side resume revision: the last id on the accepted anchor
+	// that the walk below verified as ancestral to the source branch,
+	// empty for initial synchronization. An accepted anchor carrying
+	// no shipit source id at all leaves it empty too, which the
+	// resume path rejects.
+	var resumeID string
 	for head := "HEAD"; ; {
 		// The anchor is message-level state: it must be found even when
 		// the destination prefix subtree is absent from the worktree.
@@ -369,42 +375,61 @@ func main() {
 		// initial synchronization, where tag-set exclusion drops
 		// already-mirrored commits and convergence pruning absorbs
 		// equivalent content.
+		//
+		// Prefer ids recorded on their own line; the body-wide scan is
+		// a logged fallback for hand-tagged anchors. Legacy anchors may
+		// carry abbreviations shorter than seven characters; git
+		// resolves them exactly as upstream did, so the exclusion
+		// set's length floor deliberately does not apply here.
 		anchorIDs := last[0].OwnLineShipitIDs()
 		if len(anchorIDs) == 0 {
+			log.Printf("anchor %s carries no own-line id; scanning the body", last[0])
 			anchorIDs = last[0].ShipitID()
 		}
 		resolvable := false
-		disjoint := false
+		var disjointIDs, unresolvableIDs []string
+		// The last id verified ancestral to the source branch: the
+		// resume range must stay inside the branch's own history even
+		// when a hand-tagged multi-id anchor ends with a disjoint id,
+		// so the loop records it instead of stopping at the first
+		// ancestral hit.
+		ancestralID := ""
 		for _, id := range anchorIDs {
-			if _, rerr := src.RevParse(id + "^{commit}"); rerr == nil {
-				// An id that resolves but is not an ancestor of the
-				// configured source branch cannot bound a meaningful
-				// resume range: id..srcBranch would enumerate commits
-				// unrelated to the branch being mirrored, and replaying
-				// them as patches would conflict with states the
-				// destination never held. This arises when the cache
-				// holds objects from reverse-direction syncs
-				// (refs/grit/src), absorbed foreign histories, or
-				// rewritten lineages whose pre-rewrite digests still
-				// resolve. Treat such anchors the same as unresolvable
-				// ones and walk past them.
-				isAnc, aerr := src.IsAncestor(id, srcBranch)
-				if aerr != nil {
-					log.Fatalf("%s: check ancestor of source branch %s for %s: %v", src, srcBranch, id, aerr)
-				}
-				if isAnc {
-					resolvable = true
-					break
-				}
-				disjoint = true
+			if _, rerr := src.RevParse(id + "^{commit}"); rerr != nil {
+				unresolvableIDs = append(unresolvableIDs, id)
+				continue
 			}
+			// An id that resolves but is not an ancestor of the
+			// configured source branch cannot bound a meaningful
+			// resume range: id..srcBranch would enumerate commits
+			// unrelated to the branch being mirrored, and replaying
+			// them as patches would conflict with states the
+			// destination never held. This arises when the cache
+			// holds objects from reverse-direction syncs
+			// (refs/grit/src), absorbed foreign histories, or
+			// rewritten lineages whose pre-rewrite digests still
+			// resolve. Treat such anchors the same as unresolvable
+			// ones and walk past them.
+			isAnc, aerr := src.IsAncestor(id, srcBranch)
+			if aerr != nil {
+				log.Fatalf("%s: check ancestor of source branch %s for %s: %v", src, srcBranch, id, aerr)
+			}
+			if isAnc {
+				resolvable = true
+				ancestralID = id
+				continue
+			}
+			disjointIDs = append(disjointIDs, id)
 		}
 		if len(anchorIDs) > 0 && !resolvable {
 			log.Printf("commit %s is not applicable to %s: skipping", last[0], dst)
-			if disjoint {
-				log.Printf("anchor records source id(s) %v not ancestral to source branch %s; ignoring for resume", anchorIDs, srcBranch)
-			} else {
-				log.Printf("anchor records unresolvable source id(s) %v; ignoring for resume", anchorIDs)
+			// A mixed anchor logs each category with exactly the ids it
+			// describes.
+			if len(disjointIDs) > 0 {
+				log.Printf("anchor records source id(s) %v not ancestral to source branch %s; ignoring for resume", disjointIDs, srcBranch)
+			}
+			if len(unresolvableIDs) > 0 {
+				log.Printf("anchor records unresolvable source id(s) %v; ignoring for resume", unresolvableIDs)
 			}
 			head = last[0].Digest.Hex() + "^"
 			if _, err := dst.RevParse(head); err != nil {
@@ -417,16 +442,24 @@ func main() {
 		if err != nil {
 			log.Fatalf("isCommitApplicable %s: %v", last[0], err)
 		}
-		if !applies {
+		accepted := applies
+		if !accepted {
 			// An empty anchor commit (a pure resume marker recording a
 			// source revision without any content change) is a valid
 			// synchronization point.
 			if empty, eerr := dst.PatchIsEmpty(last[0].Digest.Hex()); eerr == nil && empty {
-				lastCommit = last[0]
-				break
+				accepted = true
 			}
 		}
-		if applies {
+		if accepted {
+			// A hand-tagged multi-id anchor can end with an id that
+			// resolves outside the source branch's history; explain a
+			// resume revision that differs from the trailing id so the
+			// choice does not look like a mistake.
+			if len(anchorIDs) > 0 && anchorIDs[len(anchorIDs)-1] != ancestralID {
+				log.Printf("resuming from %s, the last id ancestral to %s, instead of trailing id %s", ancestralID, srcBranch, anchorIDs[len(anchorIDs)-1])
+			}
+			resumeID = ancestralID
 			lastCommit = last[0]
 			break
 		}
@@ -438,9 +471,6 @@ func main() {
 		}
 	}
 	var commits []*git.Commit
-	// Source-side resume revision: the shipit id recorded on lastCommit,
-	// empty for initial synchronization.
-	var srcAnchor string
 	if lastCommit == nil {
 		log.Printf("performing initial sync")
 		var err error
@@ -454,21 +484,17 @@ func main() {
 		}
 	} else {
 		log.Printf("synchronizing: last diff: %v, source: %v", lastCommit.Digest, lastCommit.ShipitID())
-		// Prefer ids recorded on their own line; the body-wide scan is
-		// a logged fallback for hand-tagged anchors. Legacy anchors may
-		// carry abbreviations shorter than seven characters; git
-		// resolves them exactly as upstream did, so the exclusion set's
-		// length floor deliberately does not apply here.
-		ids := lastCommit.OwnLineShipitIDs()
-		if len(ids) == 0 {
-			log.Printf("anchor %s carries no own-line id; scanning the body", lastCommit)
-			ids = lastCommit.ShipitID()
-		}
-		if len(ids) == 0 {
+		// The walk above already extracted and classified every id on
+		// the accepted anchor and remembered the last one verified
+		// ancestral to the source branch. Resuming from the trailing
+		// id instead would bound the range with history the branch
+		// never held whenever a hand-tagged multi-id anchor ends with
+		// a disjoint id. Empty means the anchor carries no shipit
+		// source id at all.
+		if resumeID == "" {
 			log.Fatalf("no fbshipit-source-id found in commit: %+v", lastCommit)
 		}
-		newestID := ids[len(ids)-1]
-		srcAnchor = newestID
+		newestID := resumeID
 		var err error
 		// Copy every source commit in newestID..srcBranch, not only those
 		// that descend from newestID: work merged into srcBranch from side
@@ -490,7 +516,7 @@ func main() {
 	// required: a source message merely quoting another mirror's id in
 	// prose must not cause its changes to be silently dropped.
 	// We also filter out commits that match any stripped commits.
-	raw := dropForeignMergedAncestry(src, commits, srcAnchor, srcBranch)
+	raw := dropForeignMergedAncestry(src, commits, resumeID, srcBranch)
 	commits = nil
 commitsLoop:
 	for _, commit := range raw {

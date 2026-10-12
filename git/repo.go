@@ -373,8 +373,9 @@ func (r *Repo) InProgressAM() (bool, error) {
 }
 
 // IsAncestor reports whether ancestor is equal to or an ancestor of
-// descendant. A merge-base exit status 1 means the two commits are
-// unrelated, which is not ancestry; every other git failure (bad
+// descendant. Exit status 1 from --is-ancestor is a clean negative for
+// every non-ancestral relation: a descendant, a commit on a divergent
+// line, or an entirely unrelated history. Every other git failure (bad
 // revision, transient error) is returned, so callers cannot mistake a
 // broken read for a clean negative and discard state on its strength.
 func (r *Repo) IsAncestor(ancestor, descendant string) (bool, error) {

@@ -39,8 +39,10 @@ import (
 // An anchor sharing no history with the source branch itself (a rewritten
 // source history whose pre-rewrite digests still resolve, or similar legacy
 // state) is now caught earlier in the anchor walk: such ids are treated as
-// unresolvable and walked past, so this function's disjoint-anchor branch
-// is unreachable from the main flow. It is retained as a defensive guard.
+// unresolvable and walked past, and the resume revision handed to this
+// function is the last id the walk verified as ancestral to the source
+// branch, so this function's disjoint-anchor branch is unreachable from
+// the main flow. It is retained as a defensive guard.
 // An anchor that is itself an absorbed foreign commit left behind by older
 // grit versions remains outside automatic recovery and needs manual repair;
 // grit no longer creates one, because excluded commits are never applied or
